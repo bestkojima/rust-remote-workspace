@@ -1,1 +1,6 @@
 /target
+/devices.local.toml
+*.rrw-write-lock
+/termirs.log
+/termirs.log.1
+__pycache__/

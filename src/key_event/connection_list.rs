@@ -56,25 +56,12 @@ pub async fn handle_connection_list_key<B: Backend + Write>(
             // Open file explorer for the selected connection
             if let Some(conn) = app.selected_connection() {
                 let selected_idx = app.current_selected();
-                let _ = app.config.touch_last_used(&conn.id);
-                let return_from = crate::ConnectingSource::ConnectionList {
-                    file_explorer: true,
-                };
-                let (cols, rows) = app.ssh_terminal_size().unwrap_or((80, 24));
-                let (cancel_token, receiver) =
-                    crate::async_ssh_client::SshSession::initiate_connection(
-                        conn.clone(),
-                        cols,
-                        rows,
-                    );
-                let connection_name = conn.display_name.clone();
-                app.go_to_connecting(
+                app.begin_connection(
                     conn,
-                    connection_name,
                     selected_idx,
-                    return_from,
-                    cancel_token,
-                    receiver,
+                    crate::ConnectingSource::ConnectionList {
+                        file_explorer: true,
+                    },
                 );
             }
         }
@@ -85,25 +72,12 @@ pub async fn handle_connection_list_key<B: Backend + Write>(
         KeyCode::Enter => {
             if let Some(conn) = app.selected_connection() {
                 let selected_idx = app.current_selected();
-                // Initiate connection with current terminal size
-                let (cols, rows) = app.ssh_terminal_size().unwrap_or((80, 24));
-                let (cancel_token, receiver) =
-                    crate::async_ssh_client::SshSession::initiate_connection(
-                        conn.clone(),
-                        cols,
-                        rows,
-                    );
-                let connection_name = conn.display_name.clone();
-                let return_from = crate::ConnectingSource::ConnectionList {
-                    file_explorer: false,
-                };
-                app.go_to_connecting(
+                app.begin_connection(
                     conn,
-                    connection_name,
                     selected_idx,
-                    return_from,
-                    cancel_token,
-                    receiver,
+                    crate::ConnectingSource::ConnectionList {
+                        file_explorer: false,
+                    },
                 );
             } else if len == 0 {
                 app.info = Some("No connections available".to_string());

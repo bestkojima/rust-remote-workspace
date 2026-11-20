@@ -1,6 +1,8 @@
 /// Result summary of SFTP transfer operations
 #[derive(Debug, Clone)]
 pub enum ScpResult {
+    Planned(Vec<ScpFileProgress>),
+    Cancelled(Vec<ScpFileResult>),
     Progress(ScpTransferProgress),
     Completed(Vec<ScpFileResult>),
     Error { error: String },
@@ -75,6 +77,7 @@ impl ScpFileProgress {
 /// Aggregate transfer progress for a batch of files
 #[derive(Clone, Debug)]
 pub struct ScpProgress {
+    pub cancel: tokio_util::sync::CancellationToken,
     pub connection_name: String,
     pub start_time: std::time::Instant,
     pub files: Vec<ScpFileProgress>,
@@ -89,6 +92,7 @@ pub struct ScpProgress {
 
 #[derive(Clone, Debug)]
 pub enum TransferState {
+    Cancelled,
     Pending,
     InProgress,
     Completed,
@@ -98,6 +102,7 @@ pub enum TransferState {
 impl ScpProgress {
     pub fn new(connection_name: String, files: Vec<ScpFileProgress>) -> Self {
         Self {
+            cancel: tokio_util::sync::CancellationToken::new(),
             connection_name,
             start_time: std::time::Instant::now(),
             files,
@@ -129,15 +134,8 @@ impl ScpProgress {
             }
 
             // Check if transfer is complete (100%)
-            if let Some(total) = file.total_bytes {
-                if file.transferred_bytes >= total && total > 0 {
-                    file.state = TransferState::Completed;
-                } else {
-                    file.state = TransferState::InProgress;
-                }
-            } else {
-                file.state = TransferState::InProgress;
-            }
+            // Transferring the last byte still leaves close and publication.
+            file.state = TransferState::InProgress;
         }
 
         // Track when all files reach 100% (to freeze elapsed time display)
@@ -154,7 +152,7 @@ impl ScpProgress {
                 let message = error.unwrap_or_else(|| "Unknown error".to_string());
                 file.state = TransferState::Failed(message);
             }
-            if let Some(total) = file.total_bytes {
+            if success && let Some(total) = file.total_bytes {
                 file.transferred_bytes = total;
             }
         }

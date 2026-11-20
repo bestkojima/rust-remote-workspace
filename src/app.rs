@@ -1,3 +1,8 @@
+mod host_key;
+pub(crate) mod sync;
+mod terminal_tabs;
+pub(crate) mod tunnels;
+
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -57,6 +62,12 @@ pub enum LeftExplorer {
 }
 
 impl LeftExplorer {
+    pub fn filtered_files(&self) -> &[ratatui_async_explorer::File] {
+        match self {
+            Self::Local(e) => e.filtered_files(),
+            Self::Remote(e) => e.filtered_files(),
+        }
+    }
     /// Get the current file/directory
     pub fn current(&self) -> &ratatui_async_explorer::File {
         match self {
@@ -204,6 +215,13 @@ pub enum ConnectingSource {
     },
 }
 
+#[derive(Clone, Copy)]
+pub enum AfterTrust {
+    Terminal,
+    Files,
+    Return,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum AppMode {
     ConnectionList(ListSelectionState),
@@ -224,6 +242,15 @@ pub enum AppMode {
         return_from: ConnectingSource,
         cancel_token: tokio_util::sync::CancellationToken,
         receiver: mpsc::Receiver<Result<SshSession>>,
+    },
+    VerifyHostKey {
+        connection: Connection,
+        return_to: usize,
+        previous: Box<AppMode>,
+        next: AfterTrust,
+        public_key: String,
+        fingerprint: String,
+        visible: bool,
     },
     Connected {
         name: String,
@@ -287,11 +314,18 @@ pub fn create_search_textarea() -> TextArea<'static> {
 
 /// App is the main application
 pub struct App<B: Backend + Write> {
+    pub(crate) settings_editor: Option<crate::workspace::settings::Editor>,
+    pub(crate) sync: sync::SyncDesk,
+    pub(crate) file_actions: crate::filesystem::actions::FileActions,
+    pub(crate) tunnels: tunnels::Desk,
+    pub(crate) workspace_page: crate::workspace::Page,
     pub mode: AppMode,
     pub error: Option<AppError>,
     pub info: Option<String>,
     pub config: ConfigManager,
     pub port_forwarding_runtime: crate::async_ssh_client::PortForwardingRuntime,
+    parked: remote_core::ParkedTabs<terminal_tabs::ParkedTerminal>,
+    terminal_notice: Option<String>,
     terminal: Terminal<B>,
     needs_redraw: bool, // Track if UI needs redrawing
     event_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>, // Event sender for SSH disconnect
@@ -309,10 +343,12 @@ pub struct App<B: Backend + Write> {
 
 impl<B: Backend + Write> Drop for App<B> {
     fn drop(&mut self) {
+        #[cfg(not(windows))]
         use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
         use crossterm::execute;
         use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 
+        self.cancel_terminal_readers();
         disable_raw_mode().ok();
         #[cfg(target_os = "windows")]
         execute!(self.terminal.backend_mut(), LeaveAlternateScreen,).ok();
@@ -329,11 +365,25 @@ impl<B: Backend + Write> Drop for App<B> {
 
 impl<B: Backend + Write> App<B> {
     pub fn new(terminal: Terminal<B>) -> Result<Self> {
+        Self::with_config_path(terminal, None)
+    }
+
+    pub fn with_config_path(terminal: Terminal<B>, path: Option<&std::path::Path>) -> Result<Self> {
         Ok(Self {
+            settings_editor: None,
+            sync: Default::default(),
+            file_actions: Default::default(),
+            tunnels: Default::default(),
+            workspace_page: crate::workspace::Page::Devices,
             mode: AppMode::ConnectionList(ListSelectionState::new(0)),
             error: None,
             info: None,
-            config: ConfigManager::new()?,
+            config: match path {
+                Some(path) => ConfigManager::with_path(path)?,
+                None => ConfigManager::new()?,
+            },
+            parked: Default::default(),
+            terminal_notice: None,
             port_forwarding_runtime: crate::async_ssh_client::PortForwardingRuntime::new(),
             terminal,
             needs_redraw: true,    // Initial redraw needed
@@ -355,6 +405,7 @@ impl<B: Backend + Write> App<B> {
 
     pub fn init_terminal(&mut self) -> Result<()> {
         use crossterm::ExecutableCommand;
+        #[cfg(not(windows))]
         use crossterm::event::DisableMouseCapture;
         use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
@@ -471,10 +522,13 @@ impl<B: Backend + Write> App<B> {
         Ok((cols, rows))
     }
 
-    fn set_mouse_capture(&mut self, enable: bool) -> Result<()> {
-        #[cfg(target_os = "windows")]
-        return Ok(());
+    #[cfg(windows)]
+    fn set_mouse_capture(&mut self, _enable: bool) -> Result<()> {
+        Ok(())
+    }
 
+    #[cfg(not(windows))]
+    fn set_mouse_capture(&mut self, enable: bool) -> Result<()> {
         use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
         use crossterm::execute;
 
@@ -726,6 +780,7 @@ impl<B: Backend + Write> App<B> {
         cancel_token: tokio_util::sync::CancellationToken,
         return_to_explorer: Option<ScpReturnMode>,
     ) {
+        self.terminal_notice = None;
         self.mode = AppMode::Connected {
             name,
             client,
@@ -745,9 +800,12 @@ impl<B: Backend + Write> App<B> {
 
     pub fn go_to_form_new(&mut self) {
         self.clear_selection();
+        let mut form = ConnectionForm::new();
+        form.port
+            .set_placeholder_text(self.config.default_port().to_string());
         self.mode = AppMode::FormNew {
             auto_auth: false,
-            form: ConnectionForm::new(),
+            form,
             current_selected: self.current_selected(),
         };
         self.needs_redraw = true; // Mode change requires redraw
@@ -764,6 +822,7 @@ impl<B: Backend + Write> App<B> {
     }
 
     pub fn go_to_connection_list_with_selected(&mut self, selected: usize) {
+        self.workspace_page = crate::workspace::Page::Devices;
         self.clear_selection();
         self.mode = AppMode::ConnectionList(ListSelectionState::new(selected));
         // Stop ticker when returning to connection list (idle state)
@@ -929,6 +988,7 @@ impl<B: Backend + Write> App<B> {
     /// Switch left pane to local filesystem
     pub async fn switch_left_pane_to_local(&mut self) {
         if let AppMode::FileExplorer {
+            copy_buffer,
             left_pane,
             left_explorer,
             left_session,
@@ -960,6 +1020,7 @@ impl<B: Backend + Write> App<B> {
                     }
                     *left_pane = FileExplorerPane::Local;
                     *left_explorer = LeftExplorer::Local(local_explorer);
+                    copy_buffer.retain(|op| op.direction != CopyDirection::LeftToRight);
                     self.needs_redraw = true;
                 }
                 Err(e) => {
@@ -972,8 +1033,9 @@ impl<B: Backend + Write> App<B> {
     }
 
     /// Switch left pane to an SSH connection
-    pub async fn switch_left_pane_to_ssh(&mut self, conn: Connection) {
+    pub async fn switch_left_pane_to_ssh(&mut self, mut conn: Connection) {
         if let AppMode::FileExplorer {
+            copy_buffer,
             left_pane,
             left_explorer,
             left_session,
@@ -997,20 +1059,24 @@ impl<B: Backend + Write> App<B> {
             }
 
             // Switch left pane to SSH connection
+            if let Err(error) = self.tunnels.prepare_device(&self.config, &mut conn) {
+                self.set_error(error);
+                return;
+            }
             match Self::setup_left_ssh_pane(&conn, left_pane, left_explorer, left_session).await {
                 Ok(()) => {
+                    copy_buffer.retain(|op| op.direction != CopyDirection::LeftToRight);
                     self.needs_redraw = true;
                 }
-                Err(e) => {
-                    self.error = Some(e);
-                }
+                Err(e) => self.offer_host_key_or_error(conn, e),
             }
         }
     }
 
     /// Switch right pane to a different SSH connection
-    pub async fn switch_right_pane_to_ssh(&mut self, conn: Connection) {
+    pub async fn switch_right_pane_to_ssh(&mut self, mut conn: Connection) {
         if let AppMode::FileExplorer {
+            copy_buffer,
             connection_name,
             remote_explorer,
             ssh_connection,
@@ -1040,6 +1106,10 @@ impl<B: Backend + Write> App<B> {
             }
 
             // Create new SFTP session for the right pane
+            if let Err(error) = self.tunnels.prepare_device(&self.config, &mut conn) {
+                self.set_error(error);
+                return;
+            }
             match Self::create_sftp_session(&conn).await {
                 Ok((sftp_session, new_channel, new_ssh_session)) => {
                     let remote_home = match sftp_session.canonicalize(".").await {
@@ -1067,6 +1137,7 @@ impl<B: Backend + Write> App<B> {
                             *channel = Some(new_channel);
                             *ssh_session = new_ssh_session;
                             *ssh_connection = conn;
+                            copy_buffer.retain(|op| op.direction != CopyDirection::RightToLeft);
                             self.needs_redraw = true;
                         }
                         Err(e) => {
@@ -1076,11 +1147,7 @@ impl<B: Backend + Write> App<B> {
                         }
                     }
                 }
-                Err(e) => {
-                    self.error = Some(AppError::SftpError(format!(
-                        "Failed to create SFTP session: {e}"
-                    )));
-                }
+                Err(e) => self.offer_host_key_or_error(conn, e),
             }
         }
     }
@@ -1095,9 +1162,8 @@ impl<B: Backend + Write> App<B> {
         >,
     ) -> Result<()> {
         // Create SFTP session
-        let (sftp_session, _explorer_channel, ssh_session) = Self::create_sftp_session(conn)
-            .await
-            .map_err(|e| AppError::SftpError(format!("Failed to create SFTP session: {e}")))?;
+        let (sftp_session, _explorer_channel, ssh_session) =
+            Self::create_sftp_session(conn).await?;
 
         // Get home directory
         let remote_home = sftp_session.canonicalize(".").await.map_err(|e| {
@@ -1149,7 +1215,7 @@ impl<B: Backend + Write> App<B> {
         Arc<tokio::sync::Mutex<russh::client::Handle<crate::async_ssh_client::SshClient>>>,
     )> {
         // Create a new SSH session specifically for SFTP
-        let (session, _server_key) = SshSession::new_session_with_timeout(
+        let session = SshSession::new_session_with_timeout(
             conn,
             None,
             &tokio_util::sync::CancellationToken::new(),
@@ -1201,7 +1267,9 @@ impl<B: Backend + Write> App<B> {
             | AppMode::DeleteConfirmation {
                 current_selected, ..
             } => *current_selected,
-            AppMode::Connecting { return_to, .. } => *return_to,
+            AppMode::Connecting { return_to, .. } | AppMode::VerifyHostKey { return_to, .. } => {
+                *return_to
+            }
             AppMode::ScpProgress { return_mode, .. } => match return_mode {
                 Some(ScpReturnMode::ConnectionList { current_selected }) => *current_selected,
                 Some(ScpReturnMode::Connected {
@@ -1235,10 +1303,16 @@ impl<B: Backend + Write> App<B> {
     /// keeps the filtered-view mapping in one place and makes it impossible to
     /// accidentally index the unfiltered slice.
     pub fn selected_connection(&self) -> Option<Connection> {
-        self.config
-            .connections()
-            .get(self.current_selected())
-            .cloned()
+        let index = match &self.mode {
+            AppMode::ConnectionList(state) => crate::ui::connection::resolve_visible_selection(
+                self.config.connections(),
+                None,
+                state.search.query(),
+                state.selected,
+            )?,
+            _ => self.current_selected(),
+        };
+        self.config.connections().get(index).cloned()
     }
 
     /// Mark that UI needs redrawing
@@ -1267,6 +1341,7 @@ impl<B: Backend + Write> App<B> {
     }
 
     fn draw(&mut self) -> Result<()> {
+        let open_terminals = self.terminal_count();
         let selection_anchor = self.selection_anchor;
         let selection_tail = self.selection_tail;
         let selection_forced = self.selection_force_nonempty;
@@ -1276,9 +1351,18 @@ impl<B: Backend + Write> App<B> {
             let size = f.area();
             match &mut self.mode {
                 AppMode::ConnectionList(state) => {
-                    let conns = self.config.connections();
-
-                    draw_connection_list(size, conns, state.selected, &state.search, f, false);
+                    crate::workspace::draw(
+                        f,
+                        size,
+                        self.workspace_page,
+                        state,
+                        &self.config,
+                        open_terminals,
+                        &self.tunnels,
+                        &self.sync,
+                        self.settings_editor.as_ref(),
+                        self.terminal_notice.as_deref(),
+                    );
                 }
                 AppMode::FormNew {
                     current_selected, ..
@@ -1352,7 +1436,14 @@ impl<B: Backend + Write> App<B> {
                         }
                     }
                 }
-                AppMode::Connected { name, state, .. } => {
+                AppMode::VerifyHostKey { .. } => {} // The identity panel is rendered below.
+                AppMode::Connected {
+                    name,
+                    client,
+                    state,
+                    return_to_explorer,
+                    ..
+                } => {
                     let inner = rect_with_top_margin(size, 1);
                     new_viewport = inner;
                     if let Ok(mut guard) = state.try_lock() {
@@ -1366,7 +1457,16 @@ impl<B: Backend + Write> App<B> {
                             inner.width,
                             selection_forced,
                         );
-                        draw_terminal(size, &mut guard, name, f, selection);
+                        let header = return_to_explorer.is_none().then(|| {
+                            terminal_tabs::tab_header(
+                                &self.parked,
+                                client.id(),
+                                name,
+                                size.width,
+                                self.terminal_notice.as_deref(),
+                            )
+                        });
+                        draw_terminal(size, &mut guard, name, f, selection, header);
                     }
                 }
                 AppMode::ScpProgress { return_mode, .. } => {
@@ -1397,7 +1497,7 @@ impl<B: Backend + Write> App<B> {
                                     inner.width,
                                     selection_forced,
                                 );
-                                draw_terminal(size, &mut guard, name, f, selection);
+                                draw_terminal(size, &mut guard, name, f, selection, None);
                             }
                         }
                         Some(ScpReturnMode::FileExplorer {
@@ -1639,14 +1739,36 @@ impl<B: Backend + Write> App<B> {
                 draw_connecting_popup(size, &message, f);
             }
 
-            // Overlay info popup if any
+            if let AppMode::VerifyHostKey {
+                connection,
+                public_key,
+                fingerprint,
+                visible,
+                ..
+            } = &mut self.mode
+            {
+                *visible = host_key::draw(f, size, connection, public_key, fingerprint);
+            }
+
+            if matches!(self.mode, AppMode::FileExplorer { .. }) {
+                self.file_actions.draw(f, size);
+            }
             if let Some(msg) = &self.info {
                 draw_info_popup(size, msg, f);
             }
 
             // Overlay error popup if any (always on top)
             if let Some(err) = &self.error {
-                draw_error_popup(size, &err.to_string(), f);
+                if let AppError::HostKeyChanged {
+                    endpoint,
+                    expected,
+                    received,
+                } = err
+                {
+                    host_key::draw_changed(f, size, endpoint, expected, received);
+                } else {
+                    draw_error_popup(size, &err.to_string(), f);
+                }
             }
         })?;
 
@@ -1701,6 +1823,15 @@ impl<B: Backend + Write> App<B> {
             };
 
             match ev {
+                AppEvent::FileActionDone => self.finish_file_action(),
+                AppEvent::SyncUpdate => self.sync_update(),
+                AppEvent::HomeTunnel {
+                    device,
+                    generation,
+                    event,
+                } => {
+                    self.handle_tunnel_event(device, generation, event);
+                }
                 AppEvent::Tick => {
                     // Safety net: should only receive ticks when features are active
                     let needs_tick = self.selection_auto_scroll.is_some()
@@ -1763,43 +1894,34 @@ impl<B: Backend + Write> App<B> {
                                         let conn = connection.clone();
                                         let return_to = *return_to;
 
-                                        // Save the server key if it was received
-                                        if conn.public_key.is_none()
-                                            && let Some(server_key) = client.get_server_key()
-                                            && let Some(stored_conn) = self
-                                                .config
-                                                .connections_mut()
-                                                .iter_mut()
-                                                .find(|c| c.id == conn.id)
-                                        {
-                                            stored_conn.public_key = Some(server_key.to_string());
-                                            let _ = self.config.save();
+                                        if matches!(
+                                            return_from,
+                                            ConnectingSource::ConnectionList {
+                                                file_explorer: true
+                                            }
+                                        ) {
+                                            let id = conn.id.clone();
+                                            match self.go_to_file_explorer(conn, return_to).await {
+                                                Ok(()) => {
+                                                    let _ = self.config.touch_last_used(&id);
+                                                }
+                                                Err(e) => {
+                                                    self.go_to_connection_list_with_selected(
+                                                        return_to,
+                                                    );
+                                                    self.set_error(e);
+                                                }
+                                            }
+                                            continue;
                                         }
 
-                                        if let ConnectingSource::ConnectionList { file_explorer } =
-                                            return_from
+                                        // A new profile can inherit a trusted key for the same endpoint.
+                                        if matches!(return_from, ConnectingSource::FormNew { .. })
+                                            && let Err(e) = self.config.add_connection(conn.clone())
                                         {
-                                            if *file_explorer {
-                                                let conn = connection.clone();
-                                                self.go_to_file_explorer(conn, return_to).await?;
-                                                continue;
-                                            }
-                                        }
-
-                                        // Handle based on source
-                                        if let ConnectingSource::FormNew { .. } = return_from {
-                                            // Save the connection (only for new connections)
-                                            let mut conn_to_save = conn.clone();
-                                            if let Some(server_key) = client.get_server_key() {
-                                                conn_to_save.public_key =
-                                                    Some(server_key.to_string());
-                                            }
-                                            if let Err(e) = self.config.add_connection(conn_to_save)
-                                            {
-                                                self.set_error(e);
-                                                self.go_to_form_new();
-                                                continue;
-                                            }
+                                            self.go_to_form_new();
+                                            self.set_error(e);
+                                            continue;
                                         }
 
                                         let scrollback = self.config.terminal_scrollback_lines();
@@ -1815,22 +1937,8 @@ impl<B: Backend + Write> App<B> {
                                                 rows, cols, scrollback,
                                             ),
                                         ));
-                                        let app_reader = state.clone();
-                                        let reader =
-                                            client.take_reader().expect("reader already taken");
-                                        let cancel_token =
-                                            tokio_util::sync::CancellationToken::new();
-                                        let cancel_for_task = cancel_token.clone();
-                                        let event_tx = self.event_tx.clone();
-                                        tokio::spawn(async move {
-                                            SshSession::read_loop(
-                                                reader,
-                                                app_reader,
-                                                cancel_for_task,
-                                                event_tx,
-                                            )
-                                            .await;
-                                        });
+                                        let cancel_token = client
+                                            .start_reader(state.clone(), self.event_tx.clone());
 
                                         let _ = self.config.touch_last_used(&conn.id);
                                         self.go_to_connected(
@@ -1842,31 +1950,20 @@ impl<B: Backend + Write> App<B> {
                                         );
                                     }
                                     Err(e) => {
-                                        // Connection failed - clone data before setting error
-                                        let return_from = return_from.clone();
-                                        let return_to = *return_to;
-
-                                        // Now show error and return to previous mode
-                                        self.set_error(e);
-                                        match return_from {
-                                            ConnectingSource::FormNew { auto_auth, form } => {
-                                                self.mode = AppMode::FormNew {
-                                                    auto_auth,
-                                                    form,
-                                                    current_selected: return_to,
-                                                };
+                                        let conn = connection.clone();
+                                        let next = if matches!(
+                                            return_from,
+                                            ConnectingSource::ConnectionList {
+                                                file_explorer: true
                                             }
-                                            ConnectingSource::FormEdit { form, original } => {
-                                                self.mode = AppMode::FormEdit {
-                                                    form,
-                                                    original,
-                                                    current_selected: return_to,
-                                                };
-                                            }
-                                            ConnectingSource::ConnectionList { .. } => {
-                                                self.go_to_connection_list_with_selected(return_to);
-                                            }
-                                        }
+                                        ) {
+                                            AfterTrust::Files
+                                        } else {
+                                            AfterTrust::Terminal
+                                        };
+                                        let (source, selected) = (return_from.clone(), *return_to);
+                                        self.restore_connection_source(source, selected);
+                                        self.offer_host_key(conn, e, next);
                                     }
                                 }
                             }
@@ -1877,25 +1974,7 @@ impl<B: Backend + Write> App<B> {
                                 // Connection task was cancelled or dropped
                                 let return_from = return_from.clone();
                                 let return_to = *return_to;
-                                match return_from {
-                                    ConnectingSource::FormNew { auto_auth, form } => {
-                                        self.mode = AppMode::FormNew {
-                                            auto_auth,
-                                            form,
-                                            current_selected: return_to,
-                                        };
-                                    }
-                                    ConnectingSource::FormEdit { form, original } => {
-                                        self.mode = AppMode::FormEdit {
-                                            form,
-                                            original,
-                                            current_selected: return_to,
-                                        };
-                                    }
-                                    ConnectingSource::ConnectionList { .. } => {
-                                        self.go_to_connection_list_with_selected(return_to);
-                                    }
-                                }
+                                self.restore_connection_source(return_from, return_to);
                             }
                         }
                     }
@@ -1908,7 +1987,22 @@ impl<B: Backend + Write> App<B> {
                         Event::Key(key) => {
                             match crate::key_event::handle_key_event(self, key).await {
                                 crate::key_event::KeyFlow::Continue => {}
+                                crate::key_event::KeyFlow::OpenFileSource(pane, conn) => match pane
+                                {
+                                    ActivePane::Left => self.switch_left_pane_to_ssh(*conn).await,
+                                    ActivePane::Right => self.switch_right_pane_to_ssh(*conn).await,
+                                },
+                                crate::key_event::KeyFlow::StartForward(rule) => {
+                                    crate::key_event::port_forwarding::start_forward(self, &rule)
+                                        .await;
+                                }
                                 crate::key_event::KeyFlow::Quit => {
+                                    if self.sync.working() {
+                                        self.go_to_connection_list_with_selected(0);
+                                        self.workspace_page = crate::workspace::Page::Sync;
+                                        self.set_info("A sync task is running. Press Esc, then x to cancel, or wait for the result before quitting.".into());
+                                        continue;
+                                    }
                                     return Ok(());
                                 }
                             }
@@ -1923,7 +2017,10 @@ impl<B: Backend + Write> App<B> {
                         _ => {}
                     }
                 }
-                AppEvent::TerminalUpdate => {
+                AppEvent::TerminalUpdate(id) => {
+                    if self.active_terminal_id() != Some(id) {
+                        continue;
+                    }
                     // batch most SSH output bursts
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     // Terminal has received data from SSH - mark redraw to update display
@@ -1932,7 +2029,7 @@ impl<B: Backend + Write> App<B> {
                     // TerminalUpdate events from the channel, then draw once.
                     loop {
                         match rx.try_recv() {
-                            Ok(AppEvent::TerminalUpdate) => {} // skip redundant
+                            Ok(AppEvent::TerminalUpdate(_)) => {} // skip redundant
                             Ok(other) => {
                                 pending_event = Some(other);
                                 break;
@@ -1947,6 +2044,27 @@ impl<B: Backend + Write> App<B> {
                 AppEvent::SftpProgress(result) => {
                     if let AppMode::ScpProgress { progress, .. } = &mut self.mode {
                         match result {
+                            ScpResult::Planned(files) => {
+                                progress.files = files;
+                                self.mark_redraw();
+                            }
+                            ScpResult::Cancelled(results) => {
+                                for (index, file) in results.iter().enumerate() {
+                                    progress.mark_completed(
+                                        index,
+                                        file.success,
+                                        file.error.clone(),
+                                    );
+                                    if !file.success
+                                        && let Some(row) = progress.files.get_mut(index)
+                                    {
+                                        row.state = crate::TransferState::Cancelled;
+                                    }
+                                }
+                                progress.completed = true;
+                                progress.completion_results = Some(results);
+                                self.mark_redraw();
+                            }
                             ScpResult::Progress(update) => {
                                 progress.update_progress(update);
                                 self.mark_redraw();
@@ -1995,7 +2113,7 @@ impl<B: Backend + Write> App<B> {
                                         message.push('\n');
                                         message.push_str(&line);
                                     }
-                                    pending_error = Some(AppError::SshConnectionError(message));
+                                    pending_error = Some(AppError::SftpError(message));
                                 }
 
                                 progress.completed = true;
@@ -2011,7 +2129,7 @@ impl<B: Backend + Write> App<B> {
                                 for idx in 0..progress.files.len() {
                                     progress.mark_completed(idx, false, Some(error.clone()));
                                 }
-                                let pending_error = AppError::SshConnectionError(error.clone());
+                                let pending_error = AppError::SftpError(error.clone());
                                 progress.completed = true;
                                 progress.completion_results = None;
                                 self.mark_redraw();
@@ -2020,72 +2138,8 @@ impl<B: Backend + Write> App<B> {
                         }
                     }
                 }
-                AppEvent::Disconnect => {
-                    // SSH connection has been disconnected (e.g., user typed 'exit')
-                    tracing::info!("SSH connection disconnected");
-                    // Take ownership of the mode to avoid borrow issues
-                    let old_mode = std::mem::replace(
-                        &mut self.mode,
-                        AppMode::ConnectionList(crate::ListSelectionState::new(0)),
-                    );
-                    if let AppMode::Connected {
-                        current_selected,
-                        cancel_token,
-                        name,
-                        client,
-                        return_to_explorer,
-                        ..
-                    } = old_mode
-                    {
-                        tracing::debug!("Closing connection to '{}'", name);
-                        // Cancel the read task
-                        cancel_token.cancel();
-                        // Close the SSH channel
-                        if let Err(e) = client.close_channel().await {
-                            tracing::error!("Error close SSH channel: {}", e);
-                        }
-                        // Close the SSH connection (no-op if session is None)
-                        if let Err(e) = client.close().await {
-                            tracing::error!("Error closing SSH connection: {}", e);
-                        }
-                        // Check if we should return to file explorer
-                        if let Some(ScpReturnMode::FileExplorer {
-                            connection_name,
-                            left_pane,
-                            left_explorer,
-                            left_session,
-                            remote_explorer,
-                            ssh_connection,
-                            channel,
-                            ssh_session,
-                            active_pane,
-                            copy_buffer,
-                            return_to,
-                            search,
-                        }) = return_to_explorer
-                        {
-                            self.mode = AppMode::FileExplorer {
-                                connection_name,
-                                left_pane,
-                                left_explorer,
-                                left_session,
-                                remote_explorer,
-                                ssh_connection,
-                                channel,
-                                ssh_session,
-                                active_pane,
-                                copy_buffer,
-                                return_to,
-                                search,
-                                source_selector: Default::default(),
-                                delete_confirmation: Default::default(),
-                            };
-                        } else {
-                            self.go_to_connection_list_with_selected(current_selected);
-                        }
-                        self.stop_ticker();
-                        self.mark_redraw();
-                    }
+                AppEvent::Disconnect(id) => {
+                    self.remote_disconnect(id).await;
                 }
             }
         }

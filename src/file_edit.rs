@@ -168,7 +168,7 @@ pub async fn edit_remote_file(
     };
     let tmp_path = tmp_file.path().to_string_lossy().to_string();
 
-    let (session, _server_key) = SshSession::new_session(connection).await?;
+    let session = SshSession::new_session(connection).await?;
 
     let channel_recv = session.channel_open_session().await?;
     let channel_send = session.channel_open_session().await?;

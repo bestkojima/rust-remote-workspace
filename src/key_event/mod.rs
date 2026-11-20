@@ -3,7 +3,6 @@ use std::io::Write;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::prelude::Backend;
 
-use crate::error::AppError;
 use crate::terminal::{MouseClickClass, SelectionEndpoint, make_selection_endpoint};
 use crate::ui::TerminalState;
 use crate::{App, AppMode};
@@ -33,6 +32,10 @@ const TERMINAL_MOUSE_SCROLL_STEP: i32 = 5;
 pub enum KeyFlow {
     Continue,
     Quit,
+    /// Start SSH from the main loop after the Files input future has unwound.
+    OpenFileSource(crate::ActivePane, Box<crate::config::manager::Connection>),
+    /// Start the selected rule without nesting the SSH handshake in input dispatch.
+    StartForward(Box<crate::config::manager::PortForward>),
 }
 
 /// Top-level key event handler, including error popup dismissal and dispatch by AppMode
@@ -46,9 +49,7 @@ pub async fn handle_key_event<B: Backend + Write>(app: &mut App<B>, key: KeyEven
     if app.error.is_some() {
         match key.code {
             KeyCode::Enter | KeyCode::Esc => {
-                if let Some(AppError::ChannelClosedError(_)) = app.error.take() {
-                    app.go_to_connection_list_with_selected(app.current_selected());
-                }
+                app.error = None;
             }
             _ => {}
         }
@@ -67,13 +68,21 @@ pub async fn handle_key_event<B: Backend + Write>(app: &mut App<B>, key: KeyEven
     }
 
     match &mut app.mode {
-        AppMode::ConnectionList { .. } => handle_connection_list_key(app, key).await,
+        AppMode::ConnectionList { .. } => crate::workspace::handle_key(app, key).await,
         AppMode::FormNew { .. } => handle_form_new_key(app, key).await,
         AppMode::FormEdit { .. } => handle_form_edit_key(app, key).await,
         AppMode::Connecting { .. } => handle_connecting_key(app, key).await,
+        AppMode::VerifyHostKey { .. } => {
+            app.handle_host_key(key);
+            KeyFlow::Continue
+        }
         AppMode::Connected { .. } => handle_connected_key(app, key).await,
         AppMode::ScpProgress { .. } => handle_scp_progress_key(app, key).await,
         AppMode::DeleteConfirmation { .. } => handle_delete_confirmation_key(app, key).await,
+        AppMode::FileExplorer { .. } if app.file_actions.active() => {
+            app.file_action_key(key);
+            KeyFlow::Continue
+        }
         AppMode::FileExplorer { .. } => handle_file_explorer_key(app, key).await,
         AppMode::PortForwardingList(_) => handle_port_forwarding_list_key(app, key).await,
         AppMode::PortForwardingFormNew(state) | AppMode::PortForwardingFormEdit(state)
@@ -92,14 +101,35 @@ pub async fn handle_key_event<B: Backend + Write>(app: &mut App<B>, key: KeyEven
 
 /// Paste event handler; dispatches by AppMode
 pub async fn handle_paste_event<B: Backend + Write>(app: &mut App<B>, data: &str) {
+    if matches!(app.mode, AppMode::ConnectionList(_))
+        && app.workspace_page == crate::workspace::Page::Settings
+        && app.error.is_none()
+        && app.info.is_none()
+        && let Some(editor) = app.settings_editor.as_mut()
+    {
+        editor.paste(data);
+        app.mark_redraw();
+        return;
+    }
+    if matches!(app.mode, AppMode::ConnectionList(_))
+        && app.workspace_page == crate::workspace::Page::Sync
+        && app.error.is_none()
+        && app.info.is_none()
+    {
+        app.sync.paste(data);
+        app.mark_redraw();
+        return;
+    }
+    if matches!(app.mode, AppMode::FileExplorer { .. }) && app.file_actions.active() {
+        app.file_actions.paste(data);
+        app.mark_redraw();
+        return;
+    }
     match &mut app.mode {
-        AppMode::FormNew { form, .. } => {
-            let textarea = form.focused_textarea_mut();
-            textarea.insert_str(data);
-        }
-        AppMode::FormEdit { form, .. } => {
-            let textarea = form.focused_textarea_mut();
-            textarea.insert_str(data);
+        AppMode::FormNew { form, .. } | AppMode::FormEdit { form, .. } => {
+            form.edit_focused(|field| {
+                field.insert_str(data);
+            });
         }
         AppMode::Connected {
             name: _,
@@ -131,6 +161,7 @@ pub async fn handle_paste_event<B: Backend + Write>(app: &mut App<B>, data: &str
         }
         AppMode::ConnectionList { .. }
         | AppMode::Connecting { .. }
+        | AppMode::VerifyHostKey { .. }
         | AppMode::ScpProgress { .. }
         | AppMode::DeleteConfirmation { .. }
         | AppMode::FileExplorer { .. }
@@ -156,26 +187,7 @@ async fn handle_connecting_key<B: Backend + Write>(app: &mut App<B>, key: KeyEve
         let return_from = return_from.clone();
         let return_to = *return_to;
 
-        // Return to the appropriate mode
-        match return_from {
-            crate::ConnectingSource::FormNew { auto_auth, form } => {
-                app.mode = AppMode::FormNew {
-                    auto_auth,
-                    form,
-                    current_selected: return_to,
-                };
-            }
-            crate::ConnectingSource::FormEdit { form, original } => {
-                app.mode = AppMode::FormEdit {
-                    form,
-                    original,
-                    current_selected: return_to,
-                };
-            }
-            crate::ConnectingSource::ConnectionList { .. } => {
-                app.go_to_connection_list_with_selected(return_to);
-            }
-        }
+        app.restore_connection_source(return_from, return_to);
     }
     KeyFlow::Continue
 }

@@ -6,13 +6,16 @@ mod filesystem;
 mod key_event;
 mod mode_state;
 mod search_state;
+mod sync_engine;
 mod ui;
+mod workspace;
 
 // New modules from refactoring
 mod app;
 mod events;
 mod terminal;
 mod transfer;
+mod tunnel_home;
 mod utils;
 
 // Re-export commonly used types
@@ -32,7 +35,28 @@ pub use transfer::{
     ScpFileProgress, ScpFileResult, ScpProgress, ScpResult, ScpTransferProgress, ScpTransferSpec,
     TransferState,
 };
-pub use utils::{init_panic_hook, init_tracing};
+pub use tunnel_home::HomeEvent;
+pub use utils::{init_panic_hook, init_scoped_tracing, init_tracing};
+
+/// The SSH adapter used by the workspace, usable without constructing a TUI.
+pub mod session {
+    pub use crate::async_ssh_client::SshSession;
+    pub use crate::config::manager::{AuthMethod, ConfigManager, Connection};
+    pub use remote_core::{SessionId, terminal::Output};
+}
+
+/// Single-file transfers using validated SSH endpoints, without a TUI.
+pub mod files {
+    pub use crate::filesystem::single_file::{FileLocation, FileProgress, SftpEndpoint, copy_file};
+}
+
+/// Manual directory copying without a TUI. Each execution consumes its preview.
+pub mod sync {
+    pub use crate::sync_engine::{
+        Change, ChangeKind, Direction, Preview, RemoteScope, ScopeMode, SyncProgress, SyncResult,
+        SyncSpec, execute, preview_scoped,
+    };
+}
 
 // Implement ByteProcessor for TerminalState
 impl async_ssh_client::ByteProcessor for ui::TerminalState {

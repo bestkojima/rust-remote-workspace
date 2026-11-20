@@ -10,9 +10,16 @@ pub enum TickControl {
 
 #[derive(Debug)]
 pub enum AppEvent {
+    SyncUpdate,
+    FileActionDone,
+    HomeTunnel {
+        device: String,
+        generation: u64,
+        event: crate::tunnel_home::HomeEvent,
+    },
     Input(Event),
     Tick,
-    Disconnect,                               // Sent when SSH connection is disconnected
-    TerminalUpdate,                           // Sent when SSH terminal receives data
+    Disconnect(remote_core::SessionId),
+    TerminalUpdate(remote_core::SessionId),
     SftpProgress(crate::transfer::ScpResult), // Sent when SFTP transfer has progress/completion
 }

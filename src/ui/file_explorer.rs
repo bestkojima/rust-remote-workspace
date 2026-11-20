@@ -34,7 +34,7 @@ pub fn draw_file_explorer(
         .constraints([
             Constraint::Length(3), // Header
             Constraint::Min(1),    // Content (dual panes)
-            Constraint::Length(1), // Footer
+            Constraint::Length(2), // Footer
         ])
         .split(area);
 
@@ -183,6 +183,15 @@ fn draw_pane<F: ratatui_async_explorer::FileSystem>(
         vertical: 1,
     };
     let inner = area.inner(inner_margin);
+    if explorer.filtered_files().is_empty() {
+        let message = if explorer.files().is_empty() {
+            "Empty directory"
+        } else {
+            "No matching entries"
+        };
+        f.render_widget(Paragraph::new(message).dark_gray(), inner);
+        return;
+    }
 
     let icon_display = if use_icons {
         ratatui_async_explorer::IconDisplay::Dark
@@ -211,6 +220,25 @@ fn draw_pane<F: ratatui_async_explorer::FileSystem>(
         );
     }
 
+    let [inner, meta] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    if let Some(file) = explorer.filtered_files().get(explorer.selected_idx()) {
+        let size = file
+            .size()
+            .map(|n| format!("{n} B"))
+            .unwrap_or_else(|| "Directory".into());
+        let time = file
+            .modified()
+            .map(|t| {
+                chrono::DateTime::<chrono::Local>::from(t)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        f.render_widget(
+            Paragraph::new(format!("{}   {size}   {time}", file.name())).dark_gray(),
+            meta,
+        );
+    }
     // Render the file explorer with stateful widget to track scroll position
     explorer.widget_stateful().render(inner, f.buffer_mut());
 
@@ -292,11 +320,14 @@ fn draw_footer(f: &mut Frame, area: Rect, copy_buffer: &[CopyOperation], search:
             };
             format!("Esc: Clear | Tab: Switch Pane | v: Paste ({count_label}) | q: Quit")
         } else {
-            "↑↓/jk: Move | ←→: Dir | Tab: Switch | s: Switch Source | c: Copy | d: Delete | o: Open | /: Search | H: Hidden | r: Refresh | q: Quit"
+            "Tab pane   ←/→ folder   g path   m mkdir   R rename   d delete   c/v copy   s source   o open   / search   r refresh   F7 sync pair   q back"
                 .to_string()
         };
 
-        super::render_normal_footer(f, area, &hint_text);
+        f.render_widget(
+            Paragraph::new(hint_text).wrap(ratatui::widgets::Wrap { trim: true }),
+            area,
+        );
     }
 }
 

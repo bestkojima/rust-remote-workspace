@@ -16,16 +16,30 @@ pub enum FocusField {
     DisplayName,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConnectionForm {
     pub host: TextArea<'static>,
     pub port: TextArea<'static>,
     pub username: TextArea<'static>,
     pub password: TextArea<'static>,
+    // Distinct editors: the key's decryption secret can never become a login password.
+    key_passphrase: TextArea<'static>,
+    passphrase_path: String,
+    // Some("") in an imported profile is distinct from an explicitly removed passphrase.
+    retain_empty_phrase: bool,
     pub private_key_path: TextArea<'static>,
     pub display_name: TextArea<'static>,
     pub focus: FocusField,
     pub error: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectionForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A TextArea's debug output includes the unmasked text and its undo history.
+        f.debug_struct("ConnectionForm")
+            .field("focus", &self.focus)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ConnectionForm {
@@ -35,6 +49,8 @@ impl Default for ConnectionForm {
 }
 
 impl ConnectionForm {
+    const KEYPHRASE_HINT: &str = "Optional; empty for an unencrypted key";
+
     pub fn new() -> Self {
         let mut host = TextArea::default();
         host.set_placeholder_text("Enter hostname or IP address");
@@ -48,13 +64,11 @@ impl ConnectionForm {
         username.set_placeholder_text("Enter username");
         username.set_cursor_line_style(Style::default());
 
-        let mut password = TextArea::default();
-        password.set_placeholder_text("Enter password");
-        password.set_mask_char('\u{2022}');
-        password.set_cursor_line_style(Style::default());
+        let password = Self::masked_field("Enter login password");
+        let key_passphrase = Self::masked_field(Self::KEYPHRASE_HINT);
 
         let mut private_key_path = TextArea::default();
-        private_key_path.set_placeholder_text("At least one of password or key path is required");
+        private_key_path.set_placeholder_text("Optional; Shift+Tab for key passphrase");
         private_key_path.set_cursor_line_style(Style::default());
 
         let mut display_name = TextArea::default();
@@ -66,10 +80,92 @@ impl ConnectionForm {
             port,
             username,
             password,
+            key_passphrase,
+            passphrase_path: String::new(),
+            retain_empty_phrase: false,
             private_key_path,
             display_name,
             focus: FocusField::Host,
             error: None,
+        }
+    }
+
+    fn masked_field(hint: &'static str) -> TextArea<'static> {
+        let mut field = TextArea::default();
+        field.set_placeholder_text(hint);
+        field.set_mask_char('\u{2022}');
+        field.set_cursor_line_style(Style::default());
+        field
+    }
+
+    fn has_key_path(&self) -> bool {
+        !self.get_private_key_path_value().trim().is_empty()
+    }
+
+    pub(crate) fn secret_field(&self) -> (&'static str, &TextArea<'static>) {
+        if self.has_key_path() {
+            ("Key Passphrase (Ctrl+Del: clear)", &self.key_passphrase)
+        } else {
+            ("Password", &self.password)
+        }
+    }
+
+    /// Replacing the editor, including its undo/yank buffer, binds it to exactly one path.
+    fn key_path_changed(&mut self) {
+        let path = self.get_private_key_path_value().trim();
+        if self.passphrase_path != path {
+            self.passphrase_path = path.to_owned();
+            self.retain_empty_phrase = false;
+            self.key_passphrase = Self::masked_field(Self::KEYPHRASE_HINT);
+        }
+    }
+
+    pub(crate) fn set_key_path(&mut self, path: &str) {
+        self.private_key_path.delete_line_by_head();
+        self.private_key_path.delete_line_by_end();
+        self.private_key_path.insert_str(path);
+        self.key_path_changed();
+    }
+
+    pub(crate) fn edit_focused(&mut self, edit: impl FnOnce(&mut TextArea<'static>)) {
+        edit(self.focused_textarea_mut());
+        if self.focus == FocusField::Password && !self.key_passphrase.lines()[0].is_empty() {
+            self.retain_empty_phrase = false;
+        }
+        if self.focus == FocusField::PrivateKeyPath {
+            self.key_path_changed();
+        }
+    }
+
+    pub(crate) fn input(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if self.focus == FocusField::Password
+            && self.has_key_path()
+            && key.code == KeyCode::Delete
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            self.key_passphrase = Self::masked_field(Self::KEYPHRASE_HINT);
+            self.retain_empty_phrase = false;
+        } else {
+            self.edit_focused(|field| {
+                field.input(tui_textarea::Input::from(key));
+            });
+        }
+    }
+
+    pub(crate) fn entered_auth(&self) -> Option<AuthMethod> {
+        let path = self.get_private_key_path_value().trim();
+        if !path.is_empty() {
+            let phrase = &self.key_passphrase.lines()[0];
+            Some(AuthMethod::PublicKey {
+                private_key_path: path.into(),
+                passphrase: (self.passphrase_path == path
+                    && (!phrase.is_empty() || self.retain_empty_phrase))
+                    .then(|| phrase.clone().into()),
+            })
+        } else {
+            let pwd = self.get_password_value();
+            (!pwd.is_empty()).then(|| AuthMethod::Password(pwd.to_owned().into()))
         }
     }
 
@@ -96,6 +192,10 @@ impl ConnectionForm {
     }
 
     pub fn focused_textarea_mut(&mut self) -> &mut TextArea<'static> {
+        if self.focus == FocusField::Password && self.has_key_path() {
+            self.key_path_changed();
+            return &mut self.key_passphrase;
+        }
         match self.focus {
             FocusField::Host => &mut self.host,
             FocusField::Port => &mut self.port,
@@ -145,62 +245,28 @@ impl ConnectionForm {
     }
 
     fn from_connection(conn: &Connection) -> Self {
-        let mut host = TextArea::default();
-        host.set_placeholder_text("Enter hostname or IP address");
-        host.set_cursor_line_style(Style::default());
-        host.insert_str(&conn.host);
-
-        let mut port = TextArea::default();
-        port.set_placeholder_text("22");
-        port.set_cursor_line_style(Style::default());
-        port.insert_str(conn.port.to_string());
-
-        let mut username = TextArea::default();
-        username.set_placeholder_text("Enter username");
-        username.set_cursor_line_style(Style::default());
-        username.insert_str(conn.username.clone());
-
-        let mut password = TextArea::default();
-        password.set_placeholder_text("Enter password");
-        password.set_mask_char('\u{2022}');
-        password.set_cursor_line_style(Style::default());
-
-        let mut private_key_path = TextArea::default();
-        private_key_path.set_placeholder_text("Enter private key path (optional)");
-        private_key_path.set_cursor_line_style(Style::default());
+        let mut form = Self::new();
+        form.host.insert_str(&conn.host);
+        form.port.insert_str(conn.port.to_string());
+        form.username.insert_str(&conn.username);
+        form.display_name.insert_str(&conn.display_name);
         match &conn.auth_method {
             AuthMethod::Password(pwd) => {
-                password.insert_str(pwd);
+                form.password.insert_str(pwd.as_str());
             }
             AuthMethod::PublicKey {
-                private_key_path: path,
-                ..
+                private_key_path,
+                passphrase,
             } => {
-                private_key_path.insert_str(path);
+                form.set_key_path(private_key_path);
+                if let Some(phrase) = passphrase {
+                    form.retain_empty_phrase = phrase.is_empty();
+                    form.key_passphrase.insert_str(phrase.as_str());
+                }
             }
-            AuthMethod::AutoLoadKey => {
-                // No fields to populate for auto-load key
-            }
-            AuthMethod::None => {
-                // No fields to populate for none auth
-            }
+            AuthMethod::AutoLoadKey | AuthMethod::None => {}
         }
-
-        let mut display_name = TextArea::default();
-        display_name.set_placeholder_text("Enter display name (optional)");
-        display_name.set_cursor_line_style(Style::default());
-        display_name.insert_str(conn.display_name.clone());
-
-        Self {
-            host,
-            port,
-            username,
-            password,
-            private_key_path,
-            display_name,
-            focus: FocusField::Host,
-            error: None,
-        }
+        form
     }
 }
 
@@ -413,11 +479,90 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 22,
             username: "test".to_string(),
-            auth_method: AuthMethod::Password("test".to_string().into()),
+            auth_method: AuthMethod::Password("sample form secret".to_string().into()),
         };
 
         let form = ConnectionForm::from_connection(&conn);
-        assert_eq!(form.get_password_value(), "test");
+        assert_eq!(form.get_password_value(), "sample form secret");
+        assert!(!format!("{form:?}").contains(form.get_password_value()));
+    }
+
+    #[test]
+    fn form_drafts_are_masked_and_bound_to_their_own_authentication_method() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut form = ConnectionForm::new();
+        form.focus = FocusField::Password;
+        form.edit_focused(|f| {
+            f.insert_str("account-only");
+        });
+        form.set_key_path("first-key");
+        assert!(matches!(
+            form.entered_auth(),
+            Some(AuthMethod::PublicKey {
+                passphrase: None,
+                ..
+            })
+        ));
+        form.edit_focused(|f| {
+            f.insert_str("private-key-only");
+        });
+        assert!(form.secret_field().0.contains("Passphrase"));
+        assert_eq!(form.secret_field().1.mask_char(), Some('\u{2022}'));
+        let debug = format!("{form:?}");
+        assert!(!debug.contains("private-key-only") && !debug.contains("account-only"));
+        form.set_key_path(" first-key "); // same normalized path (including reimport)
+        assert!(
+            matches!(form.entered_auth(), Some(AuthMethod::PublicKey { passphrase: Some(p), .. }) if p.as_str() == "private-key-only")
+        );
+        form.set_key_path("next-key");
+        form.input(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)); // undo must not restore the first key's phrase
+        assert!(matches!(
+            form.entered_auth(),
+            Some(AuthMethod::PublicKey {
+                passphrase: None,
+                ..
+            })
+        ));
+        form.set_key_path("");
+        assert_eq!(form.secret_field().0, "Password");
+        assert_eq!(form.secret_field().1.mask_char(), Some('\u{2022}'));
+        assert!(
+            matches!(form.entered_auth(), Some(AuthMethod::Password(p)) if p.as_str() == "account-only")
+        );
+    }
+
+    #[test]
+    fn removing_a_key_never_supplies_its_passphrase_to_ssh_password_auth() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut device = conn("key", "fixture", "localhost", "user");
+        device.auth_method = AuthMethod::PublicKey {
+            private_key_path: "saved".into(),
+            passphrase: Some("".to_owned().into()),
+        };
+        let mut form = ConnectionForm::from(&device);
+        assert!(form.entered_auth().as_ref() == Some(&device.auth_method));
+        form.focus = FocusField::Password;
+        form.input(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL));
+        assert!(matches!(
+            form.entered_auth(),
+            Some(AuthMethod::PublicKey {
+                passphrase: None,
+                ..
+            })
+        ));
+        form.edit_focused(|f| {
+            f.insert_str("for-this-key");
+        });
+        form.set_key_path("");
+        assert!(form.entered_auth().is_none());
+        form.set_key_path("saved");
+        assert!(matches!(
+            form.entered_auth(),
+            Some(AuthMethod::PublicKey {
+                passphrase: None,
+                ..
+            })
+        ));
     }
 
     fn conn(id: &str, name: &str, host: &str, user: &str) -> Connection {

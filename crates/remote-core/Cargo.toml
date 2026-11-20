@@ -1,0 +1,18 @@
+[package]
+name = "remote-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["process", "time", "macros", "rt"] }
+toml = "0.8"
+# Reuse the exact TLS/crypto backend selected by the parent SSH client.
+russh = { version = "0.57.0", default-features = false, features = ["ring", "flate2", "rsa"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = ["Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_SystemServices"] }

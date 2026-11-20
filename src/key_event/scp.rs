@@ -19,7 +19,7 @@ pub async fn handle_scp_progress_key<B: Backend + Write>(
     } = &mut app.mode
     {
         // Allow closing when fully completed OR when all files have reached 100%
-        let can_close = progress.completed || progress.all_files_done_at.is_some();
+        let can_close = progress.completed;
 
         match key.code {
             KeyCode::Enter if can_close => {
@@ -32,17 +32,16 @@ pub async fn handle_scp_progress_key<B: Backend + Write>(
                 return KeyFlow::Continue;
             }
             KeyCode::Esc => {
+                if !can_close {
+                    progress.cancel.cancel();
+                    app.mark_redraw();
+                    return KeyFlow::Continue;
+                }
                 if let Some(mode) = return_mode.take() {
-                    if can_close {
-                        debug!("Closing completed SCP transfer dialog");
-                        let results = progress.completion_results.take();
-                        let last_success = progress.last_success_destination.take();
-                        restore_after_scp_progress(app, mode, results, last_success).await;
-                    } else {
-                        info!("SCP transfer cancelled by user");
-                        app.info = Some("SCP transfer cancelled".to_string());
-                        restore_after_scp_progress(app, mode, None, None).await;
-                    }
+                    debug!("Closing completed SFTP transfer dialog");
+                    let results = progress.completion_results.take();
+                    let last_success = progress.last_success_destination.take();
+                    restore_after_scp_progress(app, mode, results, last_success).await;
                 }
                 return KeyFlow::Continue;
             }
@@ -157,23 +156,11 @@ pub async fn handle_delete_confirmation_key<B: Backend + Write>(
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 // Confirm deletion
-                match app.config.remove_connection(&connection_id) {
-                    Ok(_) => {
-                        if let Err(e) = app.config.save() {
-                            app.error = Some(e);
-                            app.go_to_connection_list_with_selected(current_selected);
-                        } else {
-                            app.info = Some("Connection deleted successfully".to_string());
-                            let new_len = app.config.connections().len();
-                            let new_selected = if new_len == 0 {
-                                0
-                            } else if current_selected >= new_len {
-                                new_len - 1
-                            } else {
-                                current_selected
-                            };
-                            app.go_to_connection_list_with_selected(new_selected);
-                        }
+                match app.config.save_removed_connection(&connection_id) {
+                    Ok(()) => {
+                        app.info = Some("Connection deleted successfully".to_string());
+                        let last = app.config.connections().len().saturating_sub(1);
+                        app.go_to_connection_list_with_selected(current_selected.min(last));
                     }
                     Err(e) => {
                         app.error = Some(e);

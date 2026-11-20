@@ -2,7 +2,6 @@ use std::io::Write;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::Backend;
-use tracing::{error, info};
 
 use super::KeyFlow;
 use super::table_handler::{handle_navigation_keys, handle_search_keys};
@@ -28,17 +27,21 @@ pub async fn handle_port_forwarding_list_key<B: Backend + Write>(
         }
     }
 
-    // Get the effective list length (filtered if search is active)
-    let len = if let AppMode::PortForwardingList(state) = &app.mode {
+    // Resolve the highlighted row through the same filter as the rendered list.
+    let AppMode::PortForwardingList(state) = &app.mode else {
+        return KeyFlow::Continue;
+    };
+    let visible: Vec<usize> = {
         if state.search.query().is_empty() {
-            app.config.port_forwards().len()
+            (0..app.config.port_forwards().len()).collect()
         } else {
             // Filter port forwards using same logic as the component
             let query_lower = state.search.query().to_lowercase();
             app.config
                 .port_forwards()
                 .iter()
-                .filter(|pf| {
+                .enumerate()
+                .filter(|(_, pf)| {
                     let connection_name = app
                         .config
                         .connections()
@@ -59,11 +62,14 @@ pub async fn handle_port_forwarding_list_key<B: Backend + Write>(
                         || pf.service_address().to_lowercase().contains(&query_lower)
                         || forward_type.to_lowercase().contains(&query_lower)
                 })
-                .count()
+                .map(|(index, _)| index)
+                .collect()
         }
-    } else {
-        app.config.port_forwards().len()
     };
+    let len = visible.len();
+    let selected = visible
+        .get(state.selected.min(len.saturating_sub(1)))
+        .copied();
 
     // Handle navigation keys using shared handler
     if let AppMode::PortForwardingList(state) = &mut app.mode {
@@ -82,13 +88,13 @@ pub async fn handle_port_forwarding_list_key<B: Backend + Write>(
             app.go_to_port_forwarding_form_new();
         }
         KeyCode::Char('e') | KeyCode::Char('E') => {
-            if let Some(original) = app.config.port_forwards().get(app.current_selected()) {
+            if let Some(original) = selected.map(|i| &app.config.port_forwards()[i]) {
                 let form = PortForwardingForm::from(original);
                 app.go_to_port_forwarding_form_edit(form);
             }
         }
         KeyCode::Char('d') | KeyCode::Char('D') => {
-            if let Some(pf) = app.config.port_forwards().get(app.current_selected()) {
+            if let Some(pf) = selected.map(|i| &app.config.port_forwards()[i]) {
                 let pf_name = pf.get_display_name();
                 let pf_id = pf.id.clone();
                 let current_selected = app.current_selected();
@@ -96,109 +102,28 @@ pub async fn handle_port_forwarding_list_key<B: Backend + Write>(
             }
         }
         KeyCode::Enter => {
-            // Toggle start/stop port forward
-            if let Some(pf) = app.config.port_forwards().get(app.current_selected()) {
-                let pf_id = pf.id.clone();
-                let pf_name = pf.get_display_name();
-
-                // Find the connection for this port forward
-                if let Some(connection) = app
-                    .config
-                    .connections()
-                    .iter()
-                    .find(|c| c.id == pf.connection_id)
-                {
-                    // Clone the connection to avoid borrowing conflicts
-                    let connection = connection.clone();
-
-                    if let Some(pf_mut) = app.config.find_port_forward_mut(&pf_id) {
-                        match pf_mut.status {
-                            PortForwardStatus::Stopped => {
-                                // Start the port forward
-                                info!("Starting port forward: {}", pf_name);
-                                match app
-                                    .port_forwarding_runtime
-                                    .start_port_forward(pf_mut, &connection)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        pf_mut.status = PortForwardStatus::Running;
-                                        info!("Port forward '{}' started successfully", pf_name);
-                                        app.info = Some(format!(
-                                            "Port forward '{pf_name}' started successfully"
-                                        ));
-                                        app.mark_redraw();
-                                    }
-                                    Err(e) => {
-                                        pf_mut.status = PortForwardStatus::Failed(e.to_string());
-                                        error!("Failed to start port forward '{}': {}", pf_name, e);
-                                        app.error = Some(AppError::ConfigError(format!(
-                                            "Failed to start port forward '{pf_name}': {e}"
-                                        )));
-                                        app.mark_redraw();
-                                    }
-                                }
-                            }
-                            PortForwardStatus::Running => {
-                                // Stop the port forward
-                                info!("Stopping port forward: {}", pf_name);
-                                match app.port_forwarding_runtime.stop_port_forward(&pf_id).await {
-                                    Ok(_) => {
-                                        pf_mut.status = PortForwardStatus::Stopped;
-                                        info!("Port forward '{}' stopped successfully", pf_name);
-                                        app.info = Some(format!(
-                                            "Port forward '{pf_name}' stopped successfully"
-                                        ));
-                                        app.mark_redraw();
-                                    }
-                                    Err(e) => {
-                                        pf_mut.status = PortForwardStatus::Failed(e.to_string());
-                                        error!("Failed to stop port forward '{}': {}", pf_name, e);
-                                        app.error = Some(AppError::ConfigError(format!(
-                                            "Failed to stop port forward '{pf_name}': {e}"
-                                        )));
-                                        app.mark_redraw();
-                                    }
-                                }
-                            }
-                            PortForwardStatus::Failed(_) => {
-                                // Try to start again after failure
-                                info!("Restarting failed port forward: {}", pf_name);
-                                match app
-                                    .port_forwarding_runtime
-                                    .start_port_forward(pf_mut, &connection)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        pf_mut.status = PortForwardStatus::Running;
-                                        info!("Port forward '{}' restarted successfully", pf_name);
-                                        app.info = Some(format!(
-                                            "Port forward '{pf_name}' restarted successfully"
-                                        ));
-                                        app.mark_redraw();
-                                    }
-                                    Err(e) => {
-                                        pf_mut.status = PortForwardStatus::Failed(e.to_string());
-                                        error!(
-                                            "Failed to restart port forward '{}': {}",
-                                            pf_name, e
-                                        );
-                                        app.error = Some(AppError::ConfigError(format!(
-                                            "Failed to restart port forward '{pf_name}': {e}"
-                                        )));
-                                        app.mark_redraw();
-                                    }
-                                }
-                            }
+            if let Some(rule) = selected.map(|i| app.config.port_forwards()[i].clone()) {
+                if rule.status == PortForwardStatus::Running {
+                    match app
+                        .port_forwarding_runtime
+                        .stop_port_forward(&rule.id)
+                        .await
+                    {
+                        Ok(()) => {
+                            app.config.find_port_forward_mut(&rule.id).unwrap().status =
+                                PortForwardStatus::Stopped;
+                            app.set_info(format!(
+                                "Port forward '{}' stopped",
+                                rule.get_display_name()
+                            ));
                         }
+                        Err(e) => app.set_error(e),
                     }
                 } else {
-                    app.error = Some(AppError::ConfigError(format!(
-                        "Connection not found for port forward '{pf_name}'"
-                    )));
+                    return KeyFlow::StartForward(Box::new(rule));
                 }
-            } else if len == 0 {
-                app.info = Some("No port forwards available".to_string());
+            } else {
+                app.set_info("No port forwards available".to_string());
             }
         }
         KeyCode::Char('q') => {
@@ -208,6 +133,42 @@ pub async fn handle_port_forwarding_list_key<B: Backend + Write>(
         _ => {}
     }
     KeyFlow::Continue
+}
+
+pub(crate) async fn start_forward<B: Backend + Write>(app: &mut App<B>, rule: &PortForward) {
+    let Some(mut connection) = app.config.find_connection(&rule.connection_id).cloned() else {
+        app.set_error(AppError::ConfigError(format!(
+            "Device for '{}' not found",
+            rule.get_display_name()
+        )));
+        return;
+    };
+    if let Err(e) = app.tunnels.prepare_device(&app.config, &mut connection) {
+        app.set_error(e);
+        return;
+    }
+    let result = app
+        .port_forwarding_runtime
+        .start_port_forward(rule, &connection)
+        .await;
+    let stored = app.config.find_port_forward_mut(&rule.id).unwrap();
+    match result {
+        Ok(()) => {
+            stored.status = PortForwardStatus::Running;
+            app.set_info(format!(
+                "Port forward '{}' started",
+                rule.get_display_name()
+            ));
+        }
+        Err(e) => {
+            stored.status = if matches!(e, AppError::UnknownHostKey { .. }) {
+                PortForwardStatus::Stopped
+            } else {
+                PortForwardStatus::Failed(e.to_string())
+            };
+            app.offer_host_key_or_error(connection, e);
+        }
+    }
 }
 
 pub async fn handle_port_forwarding_form_key<B: Backend + Write>(
@@ -360,26 +321,10 @@ pub async fn handle_port_forwarding_form_key<B: Backend + Write>(
                     Ok(_) => {
                         // After creating a new port forward, go to the end of the list
                         let new_index = app.config.port_forwards().len().saturating_sub(1);
-                        let connection = app.config.find_connection(&form_clone.connection_id);
-                        if let Some(connection) = connection {
-                            if let Err(e) = app
-                                .port_forwarding_runtime
-                                .start_port_forward(
-                                    &app.config.port_forwards()[new_index],
-                                    connection,
-                                )
-                                .await
-                            {
-                                app.error = Some(e);
-                            }
-                        } else {
-                            app.error = Some(AppError::PortForwardingError(format!(
-                                "Connection not found for port forward '{}'",
-                                form_clone.get_display_name_value()
-                            )));
-                        }
+                        let rule = app.config.port_forwards()[new_index].clone();
                         app.go_to_port_forwarding_list_with_selected(new_index)
                             .await;
+                        return KeyFlow::StartForward(Box::new(rule));
                     }
                     Err(e) => {
                         app.error = Some(e);
@@ -685,7 +630,7 @@ async fn save_port_forward<B: Backend + Write>(
 
     if is_new {
         // Create a new port forward with a new ID
-        let mut port_forward = PortForward::new(
+        let port_forward = PortForward::new(
             form.connection_id.clone(),
             form.forward_type,
             form.get_local_addr_value().to_string(),
@@ -695,10 +640,7 @@ async fn save_port_forward<B: Backend + Write>(
             remote_bind_addr,
             display_name,
         );
-        // new port forward will be immediately started, so we set the status to running here
-        port_forward.status = PortForwardStatus::Running;
         app.config.add_port_forward(port_forward)?;
-        app.info = Some("Port forward created successfully".to_string());
     } else {
         // For updates, we need to use the existing ID
         let id = form.id.clone().ok_or_else(|| {
@@ -733,7 +675,7 @@ async fn save_port_forward<B: Backend + Write>(
             status: existing.status,
         };
 
-        app.config.update_port_forward(port_forward)?;
+        app.config.save_edited_port_forward(port_forward)?;
         app.info = Some("Port forward updated successfully".to_string());
     }
 
@@ -780,25 +722,12 @@ pub async fn handle_port_forward_delete_confirmation_key<B: Backend + Write>(
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 // Confirm deletion
-                match app.config.remove_port_forward(&port_forward_id) {
-                    Ok(_) => {
-                        if let Err(e) = app.config.save() {
-                            app.error = Some(e);
-                            app.go_to_port_forwarding_list_with_selected(current_selected)
-                                .await;
-                        } else {
-                            app.info = Some("Port forward deleted successfully".to_string());
-                            let new_len = app.config.port_forwards().len();
-                            let new_selected = if new_len == 0 {
-                                0
-                            } else if current_selected >= new_len {
-                                new_len - 1
-                            } else {
-                                current_selected
-                            };
-                            app.go_to_port_forwarding_list_with_selected(new_selected)
-                                .await;
-                        }
+                match app.config.save_removed_port_forward(&port_forward_id) {
+                    Ok(()) => {
+                        app.info = Some("Port forward deleted successfully".to_string());
+                        let last = app.config.port_forwards().len().saturating_sub(1);
+                        app.go_to_port_forwarding_list_with_selected(current_selected.min(last))
+                            .await;
                     }
                     Err(e) => {
                         app.error = Some(e);

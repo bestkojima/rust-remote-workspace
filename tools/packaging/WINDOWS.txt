@@ -1,0 +1,27 @@
+Rust Remote Workspace · Windows x64
+
+把 ZIP 解压到自己的目录，双击 START.cmd。工作台和随包工具都从解压目录启动，不需要安装 Rust 或修改系统 PATH。默认读取当前 Windows 用户已有的 TermiRs 设备表。
+
+连接第一台设备
+  1. 在 Devices 按 N，填写已获授权的 SSH 地址、端口、用户名和认证方式。
+     用加密私钥时，先填 Private Key Path，再按 Shift+Tab 输入 Key Passphrase。只想保存新设备就按 Ctrl+S，不会连接。
+  2. 首次连接，把完整 SHA256 指纹与设备控制台或管理员给出的指纹核对。相同按小写 y 保存，不确定就按 Esc。已保存的公钥发生变化时，工作台会拦住连接。
+  3. 在设备上按 Enter 打开终端。F12 返回设备列表，再按 Enter 可新开一个独立终端。F6 切换，F8 关闭当前终端。
+
+传文件和同步
+  F2 打开双栏 SFTP，选文件按 c，Tab 切换目标栏，v 粘贴。
+  F7 将当前本地、远端目录保存为同步任务；F3 预览，再确认执行。只在所选远端目录符合界面所述授权条件时继续。
+  随包提供 rclone 1.72.1。若此前设置过其他路径，在 F5 → E 中将 rclone 改为本包 rclone.exe 的完整路径；移动解压目录后，同样更新这个设置。
+
+经 VPS 连接
+  开发机需要管理员提供的私有 rathole 客户端配置。在解压目录的 PowerShell 中运行（将配置路径换成实际位置）：
+    .\rust-remote.exe tunnel-agent --config "C:\private\client.toml" --rathole ".\rathole.exe"
+  家庭端在 F5 → T 选择 VPS 和开发机、设置受限转发。两台设备分别核对 Host Key。VPS 需要单独部署匹配的 rathole 服务端。
+
+入口和来源
+  工作台支持命令行参数，在解压目录运行 .\rust-remote.exe --help 查看。
+  TermiRs 0.3.4，基线 ab1910e4e251bf0b92271203b8f4dc25d8a5d015；原作者版权和 MIT 许可见 LICENSE。
+    https://github.com/caelansar/termirs
+  rclone 1.72.1 与 rathole 0.5.0 均为独立的上游程序，许可证在 licenses 目录。
+    https://github.com/rclone/rclone/releases/tag/v1.72.1
+    https://github.com/rathole-org/rathole/releases/tag/v0.5.0

@@ -52,6 +52,15 @@ jobs:
       - uses: actions/checkout@v5
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
+          bin: "rust-remote"
+          archive: $bin-$tag-$target
+          tar: unix
+          zip: windows
+          locked: true
+          target: ${{ matrix.target }}
+          token: ${{ secrets.TOKEN }}
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
           bin: "termirs"
           archive: $bin-$tag-$target
           tar: unix

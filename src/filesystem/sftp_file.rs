@@ -18,7 +18,7 @@ impl HostFile for SftpFile {
             .await
             .map_err(|e| AppError::SftpError(format!("Failed to get file metadata: {e}")))?;
         Ok(HostFileMetadata {
-            size: metadata.len(),
+            size: metadata.size,
             permissions: metadata.permissions,
         })
     }
@@ -30,15 +30,4 @@ pub async fn open_for_read(session: &SftpSession, path: &str) -> Result<SftpFile
         .open_with_flags(path, OpenFlags::READ)
         .await
         .map_err(|e| AppError::SftpError(format!("Failed to open file for reading: {e}")))
-}
-
-/// Open an SFTP file for writing (creates new file or truncates existing)
-pub async fn open_for_write(session: &SftpSession, path: &str) -> Result<SftpFile> {
-    session
-        .open_with_flags(
-            path,
-            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
-        )
-        .await
-        .map_err(|e| AppError::SftpError(format!("Failed to open file for writing: {e}")))
 }

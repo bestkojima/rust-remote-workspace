@@ -1,19 +1,17 @@
 //! Key event handling for the file explorer mode.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use futures::future::join_all;
+
 use ratatui::backend::Backend;
 use ratatui_async_explorer::Input;
 use std::io::Write;
 use tracing::{debug, error, info};
 
 use super::KeyFlow;
-use crate::AppEvent;
-use crate::async_ssh_client::HostFile;
+
 use crate::ui::file_explorer::filter_connection_indices;
 use crate::{
-    ActivePane, App, AppMode, CopyDirection, CopyOperation, FileExplorerPane, ScpFileProgress,
-    ScpFileResult, ScpProgress, ScpResult, ScpTransferSpec,
+    ActivePane, App, AppMode, CopyDirection, CopyOperation, FileExplorerPane, ScpProgress,
 };
 
 /// Handle key events in file explorer mode
@@ -24,39 +22,14 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
     // Handle delete confirmation popup first (highest priority)
     if let AppMode::FileExplorer {
         delete_confirmation,
-        left_explorer,
-        remote_explorer,
         ..
     } = &mut app.mode
         && delete_confirmation.showing
     {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                // Perform the deletion
-                debug!("User confirmed file deletion");
-                let result = match delete_confirmation.pane {
-                    ActivePane::Left => {
-                        info!("Deleting file from left pane");
-                        left_explorer.handle(Input::Delete).await
-                    }
-                    ActivePane::Right => {
-                        info!("Deleting file from right pane");
-                        remote_explorer.handle(Input::Delete).await
-                    }
-                };
-
-                if let Err(e) = result {
-                    error!("File deletion failed: {}", e);
-                    app.error = Some(crate::error::AppError::SftpError(format!(
-                        "Delete error: {e}"
-                    )));
-                } else {
-                    info!("File deletion completed successfully");
-                }
-
-                // Close the confirmation dialog
                 delete_confirmation.hide();
-                app.mark_redraw();
+                app.run_file_action(crate::filesystem::actions::Action::Delete, String::new());
                 return KeyFlow::Continue;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -207,14 +180,11 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
                 source_selector.hide();
                 source_selector.search.deactivate();
 
+                if let Some(conn) = selection {
+                    return KeyFlow::OpenFileSource(target, Box::new(conn));
+                }
                 if matches!(target, ActivePane::Left) {
-                    if let Some(conn) = selection {
-                        app.switch_left_pane_to_ssh(conn).await;
-                    } else {
-                        app.switch_left_pane_to_local().await;
-                    }
-                } else if let Some(conn) = selection {
-                    app.switch_right_pane_to_ssh(conn).await;
+                    app.switch_left_pane_to_local().await;
                 }
 
                 app.mark_redraw();
@@ -262,14 +232,14 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
                         ActivePane::Left => {
                             left_explorer.set_search_filter(Some(search.query().to_string()));
                             // Select first match if available
-                            if !left_explorer.files().is_empty() {
+                            if !left_explorer.filtered_files().is_empty() {
                                 left_explorer.set_selected_idx(0);
                             }
                         }
                         ActivePane::Right => {
                             remote_explorer.set_search_filter(Some(search.query().to_string()));
                             // Select first match if available
-                            if !remote_explorer.files().is_empty() {
+                            if !remote_explorer.filtered_files().is_empty() {
                                 remote_explorer.set_selected_idx(0);
                             }
                         }
@@ -293,13 +263,17 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
                     match active_pane {
                         ActivePane::Left => {
                             left_explorer.set_search_filter(filter);
-                            if !search.query().is_empty() && !left_explorer.files().is_empty() {
+                            if !search.query().is_empty()
+                                && !left_explorer.filtered_files().is_empty()
+                            {
                                 left_explorer.set_selected_idx(0);
                             }
                         }
                         ActivePane::Right => {
                             remote_explorer.set_search_filter(filter);
-                            if !search.query().is_empty() && !remote_explorer.files().is_empty() {
+                            if !search.query().is_empty()
+                                && !remote_explorer.filtered_files().is_empty()
+                            {
                                 remote_explorer.set_selected_idx(0);
                             }
                         }
@@ -338,6 +312,15 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
             return KeyFlow::Continue;
         }
 
+        if matches!(
+            key.code,
+            KeyCode::Char('c' | 'd' | 'o' | 'R' | 'l') | KeyCode::Enter | KeyCode::Right
+        ) && match active_pane {
+            ActivePane::Left => left_explorer.filtered_files().is_empty(),
+            ActivePane::Right => remote_explorer.filtered_files().is_empty(),
+        } {
+            return KeyFlow::Continue;
+        }
         // Handle copy mode cancellation first
         if key.code == KeyCode::Esc && !copy_buffer.is_empty() {
             copy_buffer.clear();
@@ -490,6 +473,17 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
                 app.mark_redraw();
             }
 
+            KeyCode::F(7) if copy_buffer.is_empty() && !search.is_on() => {
+                app.sync_from_files();
+            }
+            KeyCode::Char('g' | 'm' | 'R') => {
+                use crate::filesystem::actions::Action;
+                app.prompt_file_action(match key.code {
+                    KeyCode::Char('g') => Action::Go,
+                    KeyCode::Char('m') => Action::Mkdir,
+                    _ => Action::Rename,
+                });
+            }
             // Delete file: Show delete confirmation
             KeyCode::Char('d') => {
                 let (current_file, pane) = match active_pane {
@@ -497,13 +491,9 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
                     ActivePane::Right => (remote_explorer.current(), ActivePane::Right),
                 };
 
-                // Skip delete confirmation for directories
-                if current_file.is_dir() {
-                    app.info = Some("Cannot delete directories".to_string());
-                    app.mark_redraw();
+                if matches!(current_file.name().trim_end_matches('/'), "" | "." | "..") {
                     return KeyFlow::Continue;
                 }
-
                 // Show delete confirmation dialog
                 delete_confirmation.show(current_file.name().to_string(), pane);
                 app.mark_redraw();
@@ -610,20 +600,7 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
                     let state = std::sync::Arc::new(tokio::sync::Mutex::new(
                         crate::ui::TerminalState::new_with_scrollback(rows, cols, scrollback),
                     ));
-                    let reader = client.take_reader().expect("reader already taken");
-                    let cancel_token = tokio_util::sync::CancellationToken::new();
-                    let cancel_for_task = cancel_token.clone();
-                    let event_tx = app.get_event_sender();
-                    let state_for_task = state.clone();
-                    tokio::spawn(async move {
-                        crate::async_ssh_client::SshSession::read_loop(
-                            reader,
-                            state_for_task,
-                            cancel_for_task,
-                            event_tx,
-                        )
-                        .await;
-                    });
+                    let cancel_token = client.start_reader(state.clone(), app.get_event_sender());
 
                     app.go_to_connected_with_return(
                         conn_name,
@@ -667,6 +644,9 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
                     ActivePane::Right => (remote_explorer.current(), CopyDirection::RightToLeft),
                 };
 
+                if matches!(current_file.name().trim_end_matches('/'), "" | "." | "..") {
+                    return KeyFlow::Continue;
+                }
                 let is_dir = current_file.is_dir();
                 let source_path = current_file.path().to_string_lossy().into_owned();
                 if let Some(existing_idx) = copy_buffer
@@ -732,418 +712,69 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
                     return KeyFlow::Continue;
                 }
 
-                // Determine transfer mode based on pane types
-                let (is_ssh_to_ssh, mode) = match direction {
-                    CopyDirection::LeftToRight => {
-                        // Source is left pane, dest is right pane (always SSH)
-                        let is_ssh_to_ssh = matches!(left_pane, FileExplorerPane::RemoteSsh { .. });
-                        (is_ssh_to_ssh, crate::ui::ScpMode::Send)
-                    }
-                    CopyDirection::RightToLeft => {
-                        // Source is right pane (always SSH), dest is left pane
-                        let is_ssh_to_ssh = matches!(left_pane, FileExplorerPane::RemoteSsh { .. });
-                        (is_ssh_to_ssh, crate::ui::ScpMode::Receive)
-                    }
-                };
-
-                let mut transfer_specs = Vec::new();
-                let mut all_dirs_to_create: Vec<String> = Vec::new();
-
-                for item in copy_buffer.iter() {
-                    let source_name = item.source_name.trim_end_matches('/');
-
-                    if item.is_dir {
-                        // Directory: enumerate recursively to build manifest
-                        let dest_dir_path =
-                            format!("{}/{}", dest_dir.trim_end_matches('/'), source_name);
-
-                        let manifest_result = match direction {
-                            CopyDirection::LeftToRight => {
-                                // Source is left pane
-                                match left_explorer {
-                                    crate::LeftExplorer::Local(_) => {
-                                        crate::filesystem::dir_walker::walk_local_dir(
-                                            &item.source_path,
-                                            &dest_dir_path,
-                                        )
-                                        .await
-                                    }
-                                    crate::LeftExplorer::Remote(explorer) => {
-                                        crate::filesystem::dir_walker::walk_remote_dir(
-                                            explorer.filesystem(),
-                                            &item.source_path,
-                                            &dest_dir_path,
-                                        )
-                                        .await
-                                    }
-                                }
-                            }
-                            CopyDirection::RightToLeft => {
-                                // Source is right pane (always SSH)
-                                crate::filesystem::dir_walker::walk_remote_dir(
-                                    remote_explorer.filesystem(),
-                                    &item.source_path,
-                                    &dest_dir_path,
-                                )
-                                .await
-                            }
-                        };
-
-                        match manifest_result {
-                            Ok(manifest) => {
-                                all_dirs_to_create.extend(manifest.directories);
-                                for (src, dst, _size) in manifest.files {
-                                    let (local_path, remote_path) = match direction {
-                                        CopyDirection::LeftToRight => (src, dst),
-                                        CopyDirection::RightToLeft => (dst, src),
-                                    };
-                                    let display_name = local_path
-                                        .rsplit_once('/')
-                                        .map(|(_, name)| name.to_string())
-                                        .unwrap_or_else(|| local_path.clone());
-                                    let destination_filename = display_name.clone();
-
-                                    transfer_specs.push(ScpTransferSpec {
-                                        mode,
-                                        local_path,
-                                        remote_path,
-                                        display_name,
-                                        destination_filename,
-                                        is_ssh_to_ssh,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                app.error = Some(crate::error::AppError::SftpError(format!(
-                                    "Failed to enumerate directory '{}': {e}",
-                                    source_name
-                                )));
-                                app.mark_redraw();
-                                return KeyFlow::Continue;
-                            }
-                        }
-                    } else {
-                        // Regular file: existing logic
-                        let (local_path, remote_path, display_name, destination_filename) =
-                            match direction {
-                                CopyDirection::LeftToRight => {
-                                    let remote_dest = format!(
-                                        "{}/{}",
-                                        dest_dir.trim_end_matches('/'),
-                                        source_name
-                                    );
-                                    (
-                                        item.source_path.clone(),
-                                        remote_dest.clone(),
-                                        source_name.to_string(),
-                                        std::path::Path::new(&remote_dest)
-                                            .file_name()
-                                            .map(|f| f.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| source_name.to_string()),
-                                    )
-                                }
-                                CopyDirection::RightToLeft => {
-                                    let local_dest = format!(
-                                        "{}/{}",
-                                        dest_dir.trim_end_matches('/'),
-                                        source_name
-                                    );
-                                    (
-                                        local_dest.clone(),
-                                        item.source_path.clone(),
-                                        source_name.to_string(),
-                                        std::path::Path::new(&local_dest)
-                                            .file_name()
-                                            .map(|f| f.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| source_name.to_string()),
-                                    )
-                                }
-                            };
-
-                        transfer_specs.push(ScpTransferSpec {
-                            mode,
-                            local_path,
-                            remote_path,
-                            display_name,
-                            destination_filename,
-                            is_ssh_to_ssh,
-                        });
-                    }
-                }
-
-                if transfer_specs.is_empty() && all_dirs_to_create.is_empty() {
-                    app.info = Some("No files found in selected directories".to_string());
-                    app.mark_redraw();
-                    return KeyFlow::Continue;
-                }
-
-                copy_buffer.clear();
-
-                let old_mode = std::mem::replace(
-                    &mut app.mode,
-                    AppMode::ConnectionList(crate::ListSelectionState::new(0)),
-                );
-
-                if let AppMode::FileExplorer {
+                let AppMode::FileExplorer {
                     connection_name,
                     left_pane,
                     left_explorer,
                     left_session,
                     remote_explorer,
                     ssh_connection,
-                    channel: _channel,
+                    channel,
                     ssh_session,
                     active_pane,
-                    copy_buffer: _,
+                    copy_buffer,
                     return_to,
                     search,
                     ..
-                } = old_mode
-                {
-                    let (sftp_sender, mut sftp_receiver) =
-                        tokio::sync::mpsc::channel::<ScpResult>(64);
-
-                    let progress_items: Vec<ScpFileProgress> = transfer_specs
-                        .iter()
-                        .map(ScpFileProgress::from_spec)
-                        .collect();
-                    let progress = ScpProgress::new(connection_name.clone(), progress_items);
-
-                    // for (idx, spec) in transfer_specs.iter().enumerate() {
-                    //     if matches!(spec.mode, crate::ui::ScpMode::Send)
-                    //         && let Ok(metadata) =
-                    //             tokio::fs::metadata(crate::expand_tilde(&spec.local_path)).await
-                    //         && let Some(file_progress) = progress.files.get_mut(idx)
-                    //     {
-                    //         file_progress.total_bytes = Some(metadata.len());
-                    //     }
-                    // }
-
-                    // Clone left_pane if it exists for SSH-to-SSH transfers (before moving into return_mode)
-                    let left_pane_for_transfer = left_pane.clone();
-
-                    // Clone left_explorer for use in the transfer async block (before moving into return_mode)
-                    let left_explorer_for_transfer = left_explorer.clone();
-
-                    // Clone session handles for SSH-to-SSH transfers
-                    let ssh_session_for_transfer = ssh_session.clone();
-
-                    let return_mode = crate::ScpReturnMode::FileExplorer {
-                        connection_name: connection_name.clone(),
-                        left_pane,
-                        left_explorer,
-                        left_session,
-                        remote_explorer,
-                        ssh_connection: ssh_connection.clone(),
-                        channel: None,
-                        ssh_session,
-                        active_pane,
-                        copy_buffer: Vec::new(),
-                        return_to,
-                        search: search.clone(),
-                    };
-
-                    app.go_to_scp_progress(progress, return_mode);
-
-                    // Spawn forwarder task to convert ScpResult -> AppEvent::SftpProgress
-                    let event_tx = app.get_event_sender().expect("event sender must be set");
-                    tokio::spawn(async move {
-                        while let Some(result) = sftp_receiver.recv().await {
-                            if event_tx.send(AppEvent::SftpProgress(result)).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    tokio::spawn(async move {
-                        // Phase 1: Create destination directories
-                        if !all_dirs_to_create.is_empty() {
-                            let dir_result = if is_ssh_to_ssh {
-                                match mode {
-                                    crate::ui::ScpMode::Send => {
-                                        // Dest is right SSH
-                                        create_remote_dirs(&ssh_connection, &all_dirs_to_create)
-                                            .await
-                                    }
-                                    crate::ui::ScpMode::Receive => {
-                                        // Dest is left SSH
-                                        if let crate::FileExplorerPane::RemoteSsh {
-                                            connection_name: _,
-                                            connection,
-                                        } = &left_pane_for_transfer
-                                        {
-                                            create_remote_dirs(connection, &all_dirs_to_create)
-                                                .await
-                                        } else {
-                                            create_local_dirs(&all_dirs_to_create).await
-                                        }
-                                    }
-                                }
-                            } else {
-                                match mode {
-                                    crate::ui::ScpMode::Send => {
-                                        // Dest is remote SSH
-                                        create_remote_dirs(&ssh_connection, &all_dirs_to_create)
-                                            .await
-                                    }
-                                    crate::ui::ScpMode::Receive => {
-                                        // Dest is local filesystem
-                                        create_local_dirs(&all_dirs_to_create).await
-                                    }
-                                }
-                            };
-
-                            if let Err(e) = dir_result {
-                                let _ = sftp_sender
-                                    .send(ScpResult::Error {
-                                        error: format!("Failed to create directories: {e}"),
-                                    })
-                                    .await;
-                                return;
-                            }
-                        }
-
-                        // Phase 2: Transfer files
-                        let total = transfer_specs.len();
-                        let mut tasks = Vec::with_capacity(total);
-
-                        for (index, spec) in transfer_specs.into_iter().enumerate() {
-                            let ssh_connection = ssh_connection.clone();
-                            let unified_tx = sftp_sender.clone();
-                            let ssh_session_clone = ssh_session_for_transfer.clone();
-                            let left_explorer_clone = left_explorer_for_transfer.clone();
-
-                            // Open a channel from the right SSH session for this transfer
-                            let channel = {
-                                let session = ssh_session_clone.lock().await;
-                                session.channel_open_session().await.ok()
-                            };
-
-                            tasks.push(tokio::spawn(async move {
-                                let transfer_result = if spec.is_ssh_to_ssh {
-                                    // SSH-to-SSH transfer: Open a channel from the existing session handle
-                                    // This reuses the TCP connection instead of creating a new one per file
-                                    match spec.mode {
-                                        crate::ui::ScpMode::Send => {
-                                            // Left SSH → Right SSH: Open channel from RIGHT session
-                                            if let crate::LeftExplorer::Remote(explorer) = &left_explorer_clone {
-                                                match crate::filesystem::sftp_file::open_for_read(explorer.filesystem().session(), &spec.local_path).await {
-                                                    Ok(sftp_file) => {
-                                                        let file_size = sftp_file.file_metadata().await.map(|m| m.size);
-                                                        let progress_reporter = crate::async_ssh_client::TxProgressReporter::new(Some(unified_tx.clone()), index, file_size.ok());
-
-
-                                                        crate::async_ssh_client::SshSession::sftp_send_file_with_timeout(
-                                                            channel,
-                                                            &ssh_connection,
-                                                            sftp_file,
-                                                            &spec.remote_path,
-                                                            None,
-                                                            &tokio_util::sync::CancellationToken::new(),
-                                                            progress_reporter,
-                                                        )
-                                                        .await
-                                                    }
-                                                    Err(e) => Err(e),
-                                                }
-                                            } else {
-                                                Err(crate::error::AppError::SftpError(
-                                                    "SSH-to-SSH Send failed: left SFTP session not available".to_string()
-                                                ))
-                                            }
-                                        }
-                                        crate::ui::ScpMode::Receive => {
-                                            // Right SSH → Left SSH: Open channel from LEFT session (if available)
-                                            if let crate::LeftExplorer::Remote(explorer) = &left_explorer_clone {
-                                                match crate::filesystem::sftp_file::open_for_write(explorer.filesystem().session(), &spec.local_path).await {
-                                                    Ok(sftp_file) => {
-                                                        let progress_reporter = crate::async_ssh_client::TxProgressReporter::new(Some(unified_tx.clone()), index, None);
-
-                                                        crate::async_ssh_client::SshSession::sftp_receive_file_with_timeout(
-                                                            channel,
-                                                            &ssh_connection,
-                                                            &spec.remote_path,
-                                                            sftp_file,
-                                                            None,
-                                                            &tokio_util::sync::CancellationToken::new(),
-                                                            progress_reporter,
-                                                        )
-                                                        .await
-                                                    }
-                                                    Err(e) => Err(e),
-                                                }
-                                            } else {
-                                                Err(crate::error::AppError::SftpError(
-                                                    "SSH-to-SSH Receive failed: left SFTP session not available".to_string()
-                                                ))
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // Regular local-to-SSH or SSH-to-local transfer
-                                    match spec.mode {
-                                        crate::ui::ScpMode::Send => {
-                                            crate::async_ssh_client::SshSession::sftp_send_file(
-                                                channel,
-                                                &ssh_connection,
-                                                &spec.local_path,
-                                                &spec.remote_path,
-                                                index,
-                                                Some(unified_tx.clone()),
-                                            )
-                                            .await
-                                        }
-                                        crate::ui::ScpMode::Receive => {
-                                            crate::async_ssh_client::SshSession::sftp_receive_file(
-                                                channel,
-                                                &ssh_connection,
-                                                &spec.remote_path,
-                                                &spec.local_path,
-                                                index,
-                                                Some(unified_tx),
-                                            )
-                                            .await
-                                        }
-                                    }
-                                };
-
-                                let success = transfer_result.is_ok();
-                                let error = transfer_result.err().map(|e| e.to_string());
-
-                                ScpFileResult {
-                                    mode: spec.mode,
-                                    local_path: spec.local_path,
-                                    remote_path: spec.remote_path,
-                                    destination_filename: spec.destination_filename,
-                                    success,
-                                    error,
-                                    completed_at: Some(std::time::Instant::now()),
-                                }
-                            }));
-                        }
-
-                        let joined = join_all(tasks).await;
-                        let mut results = Vec::with_capacity(joined.len());
-
-                        for outcome in joined {
-                            match outcome {
-                                Ok(file_result) => results.push(file_result),
-                                Err(e) => {
-                                    let _ = sftp_sender
-                                        .send(ScpResult::Error {
-                                            error: format!("Transfer task failed to complete: {e}"),
-                                        })
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-
-                        let _ = sftp_sender.send(ScpResult::Completed(results)).await;
-                    });
-                }
+                } = std::mem::replace(
+                    &mut app.mode,
+                    AppMode::ConnectionList(crate::ListSelectionState::new(0)),
+                )
+                else {
+                    unreachable!()
+                };
+                let Some(events) = app.get_event_sender() else {
+                    unreachable!("Files requires an event sender")
+                };
+                let progress = ScpProgress::new(connection_name.clone(), Vec::new());
+                let cancel = progress.cancel.clone();
+                use crate::{files::SftpEndpoint, filesystem::file_copy::Side};
+                let left = match &left_explorer {
+                    crate::LeftExplorer::Local(_) => Side::Local,
+                    crate::LeftExplorer::Remote(e) => Side::Remote(SftpEndpoint::from_parts(
+                        e.filesystem().clone(),
+                        left_session.as_ref().unwrap().clone(),
+                    )),
+                };
+                let right = Side::Remote(SftpEndpoint::from_parts(
+                    remote_explorer.filesystem().clone(),
+                    ssh_session.clone(),
+                ));
+                let return_mode = crate::ScpReturnMode::FileExplorer {
+                    connection_name,
+                    left_pane,
+                    left_explorer,
+                    left_session,
+                    remote_explorer,
+                    ssh_connection,
+                    channel,
+                    ssh_session,
+                    active_pane,
+                    copy_buffer: Vec::new(),
+                    return_to,
+                    search,
+                };
+                app.go_to_scp_progress(progress, return_mode);
+                app.start_ticker();
+                tokio::spawn(crate::filesystem::file_copy::run(
+                    copy_buffer,
+                    dest_dir,
+                    left,
+                    right,
+                    cancel,
+                    events,
+                ));
             }
-
             // Toggle hidden files
             KeyCode::Char('H') => {
                 let result = match active_pane {
@@ -1272,52 +903,6 @@ pub async fn handle_file_explorer_key<B: Backend + Write>(
     } else {
         KeyFlow::Continue
     }
-}
-
-/// Create directories on a remote host via a new SFTP session.
-async fn create_remote_dirs(
-    connection: &crate::config::manager::Connection,
-    dirs: &[String],
-) -> crate::error::Result<()> {
-    let sftp = crate::async_ssh_client::SshSession::setup_sftp_session(
-        None,
-        connection,
-        None,
-        &tokio_util::sync::CancellationToken::new(),
-    )
-    .await?;
-    for dir in dirs {
-        match sftp
-            .mkdir(dir.as_str(), russh_sftp::protocol::FileAttributes::empty())
-            .await
-        {
-            Ok(_) => {}
-            Err(_) => {
-                // Check if it already exists by trying stat
-                match sftp.stat(dir.as_str()).await {
-                    Ok(attrs) if attrs.attrs.is_dir() => {} // Already exists
-                    _ => {
-                        return Err(crate::error::AppError::SftpError(format!(
-                            "Failed to create remote directory: {dir}"
-                        )));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Create directories on the local filesystem.
-async fn create_local_dirs(dirs: &[String]) -> crate::error::Result<()> {
-    for dir in dirs {
-        tokio::fs::create_dir_all(dir).await.map_err(|e| {
-            crate::error::AppError::SftpError(format!(
-                "Failed to create local directory '{dir}': {e}"
-            ))
-        })?;
-    }
-    Ok(())
 }
 
 /// Perform file editing outside the `app.mode` borrow scope.

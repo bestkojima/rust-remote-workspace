@@ -4,10 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::Backend;
 
 use super::KeyFlow;
-use crate::{
-    AppEvent,
-    app::{App, AppMode},
-};
+use crate::app::{App, AppMode};
 
 /// Helper function to scroll to bottom if needed
 async fn ensure_scroll_to_bottom(
@@ -128,6 +125,31 @@ fn encode_key_event_to_ansi(app_cursor: bool, key: &KeyEvent) -> Option<Vec<u8>>
 pub async fn handle_connected_key<B: Backend + Write>(app: &mut App<B>, key: KeyEvent) -> KeyFlow {
     app.clear_selection();
 
+    if key.modifiers.is_empty()
+        && let AppMode::Connected {
+            client,
+            return_to_explorer: None,
+            ..
+        } = &app.mode
+    {
+        match key.code {
+            KeyCode::F(6) => {
+                app.cycle_terminal();
+                return KeyFlow::Continue;
+            }
+            KeyCode::F(8) => {
+                let id = client.id();
+                app.close_terminal(id).await;
+                return KeyFlow::Continue;
+            }
+            KeyCode::F(12) => {
+                app.park_terminal();
+                return KeyFlow::Continue;
+            }
+            _ => {}
+        }
+    }
+
     if let AppMode::Connected {
         name: _,
         client,
@@ -182,7 +204,8 @@ pub async fn handle_connected_key<B: Backend + Write>(app: &mut App<B>, key: Key
                         app.error = Some(e);
                     }
                 } else {
-                    app.send_event(AppEvent::Disconnect);
+                    let id = client.id();
+                    app.close_terminal(id).await;
                 }
             }
             // Special scrolling behavior for PageUp/PageDown - these need local scrolling

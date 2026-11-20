@@ -1,5 +1,6 @@
 [package]
 name = "termirs"
+default-run = "rust-remote"
 version = "0.3.4"
 edition = "2024"
 authors = ["Caelansar"]
@@ -10,9 +11,15 @@ readme = "README.md"
 keywords = ["ssh", "terminal", "sftp"]
 categories = ["command-line-interface"]
 
+[workspace]
+members = ["crates/remote-core"]
+resolver = "3"
+
 [dependencies]
+remote-core = { path = "crates/remote-core" }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 ring = "0.17"
+zeroize = "1.8"
 crossterm = { version = "0.28", features = ["event-stream"] }
 # vt100 = "0.16"  # Replaced by wezterm-term
 thiserror = "1.0"
@@ -21,7 +28,7 @@ base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal"] }
 tokio-util = "0.7.16"
 # Default features pull in aws-lc-rs, whose build requires CMake + a Visual Studio
 # generator that the `cmake` crate can resolve. That breaks on Windows runners once
@@ -48,12 +55,19 @@ tracing-appender = "0.2"
 grep-searcher = "0.1"
 grep-regex = "0.1"
 grep-matcher = "0.1"
+glob = "0.3"
+serde_json = "1"
 content_inspector = "0.2"
 edit = "0.1"
 tempfile = "3"
 wezterm-term = { git = "https://github.com/caelansar/wezterm.git", package = "wezterm-term" }
 wezterm-surface = { git = "https://github.com/caelansar/wezterm.git", package = "wezterm-surface" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = ["Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 rand = "0.8"

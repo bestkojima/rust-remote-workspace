@@ -5,16 +5,14 @@ use std::time::Duration;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::sync::{OnceCell, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use russh::client::{self, AuthResult, KeyboardInteractiveAuthResponse};
 use russh::keys::{self, PrivateKeyWithHashAlg, ssh_key};
-use russh::{
-    Channel, ChannelMsg, Disconnect, Error as RusshError, MethodKind, Preferred, compression,
-};
+use russh::{Channel, Disconnect, Error as RusshError, MethodKind, Preferred, compression};
 use russh_sftp::client::rawsession::RawSftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use tokio::net::{TcpListener, TcpStream};
@@ -23,7 +21,11 @@ use crate::config::manager::{AuthMethod, Connection, PortForward, PortForwardTyp
 use crate::error::{AppError, Result};
 use crate::transfer::{ScpResult, ScpTransferProgress};
 
-const STANDARD_KEY_PATHS: &[&str] = &[
+// Unit tests looking up default keys may only see their explicitly scoped fixture.
+#[cfg(test)]
+tokio::task_local! { static TEST_SSH_HOME: PathBuf; }
+
+pub(crate) const STANDARD_KEY_PATHS: &[&str] = &[
     "~/.ssh/id_rsa",
     "~/.ssh/id_ecdsa",
     "~/.ssh/id_ecdsa_sk",
@@ -35,13 +37,16 @@ const FILE_BUFFER_SIZE: usize = 512 * 1024;
 const CHUNK_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT_READS: usize = 12;
 const MAX_CONCURRENT_WRITES: usize = 12;
+const REMOTE_FORWARD_BACKLOG: usize = 16;
+const REMOTE_FORWARD_CONNECTIONS: usize = 64;
 
 pub(crate) trait ByteProcessor {
     fn process_bytes(&mut self, bytes: &[u8]);
 }
 
+#[derive(Default, Clone, Copy)]
 pub(crate) struct HostFileMetadata {
-    pub size: u64,
+    pub size: Option<u64>,
     pub permissions: Option<u32>,
 }
 
@@ -56,7 +61,7 @@ impl HostFile for tokio::fs::File {
             .await
             .map_err(|e| AppError::SftpError(format!("Failed to get metadata: {e}")))?;
         Ok(HostFileMetadata {
-            size: metadata.len(),
+            size: Some(metadata.len()),
             #[cfg(unix)]
             permissions: Some({
                 use std::os::unix::fs::PermissionsExt;
@@ -111,9 +116,8 @@ impl ProgressReporter for TxProgressReporter {
 
 pub struct SshClient {
     connection: Connection,
-    server_key: Arc<OnceCell<String>>,
     // Channel for forwarding remote port forwarding connections
-    forwarded_tcpip_tx: Option<tokio::sync::mpsc::UnboundedSender<Channel<client::Msg>>>,
+    forwarded_tcpip_tx: Option<mpsc::Sender<Channel<client::Msg>>>,
 }
 
 impl client::Handler for SshClient {
@@ -123,28 +127,29 @@ impl client::Handler for SshClient {
         &mut self,
         server_public_key: &ssh_key::PublicKey,
     ) -> std::result::Result<bool, Self::Error> {
-        // Encode the server public key in OpenSSH format
-        let server_key_openssh = server_public_key.to_openssh().map_err(|e| {
-            AppError::SshPublicKeyValidationError(format!("Failed to encode server key: {e}"))
+        let fingerprint =
+            |key: &ssh_key::PublicKey| key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        let Some(pin) = self.connection.public_key.as_deref() else {
+            return Err(AppError::UnknownHostKey {
+                public_key: server_public_key.to_openssh().map_err(|e| {
+                    AppError::SshPublicKeyValidationError(format!("Could not encode host key: {e}"))
+                })?,
+                fingerprint: fingerprint(server_public_key),
+            });
+        };
+        let saved = ssh_key::PublicKey::from_openssh(pin).map_err(|_| {
+            AppError::SshPublicKeyValidationError(format!(
+                "Invalid saved host key for {}. Connection blocked.",
+                self.connection.host_port()
+            ))
         })?;
-
-        // Store the server key for later validation
-        let _ = self.server_key.set(server_key_openssh.clone());
-
-        // Check if connection already has a stored public key
-        if let Some(stored_key) = &self.connection.public_key {
-            // Compare stored key with server key
-            if stored_key == &server_key_openssh {
-                return Ok(true);
-            } else {
-                return Err(AppError::SshPublicKeyValidationError(format!(
-                    "Server public key mismatch for {}:{}. Expected: {}, Got: {}",
-                    self.connection.host, self.connection.port, stored_key, server_key_openssh
-                )));
-            }
+        if saved.key_data() != server_public_key.key_data() {
+            return Err(AppError::HostKeyChanged {
+                endpoint: self.connection.host_port(),
+                expected: fingerprint(&saved),
+                received: fingerprint(server_public_key),
+            });
         }
-
-        // No stored key, accept it for now - we'll save it after successful connection
         Ok(true)
     }
 
@@ -156,7 +161,7 @@ impl client::Handler for SshClient {
         connected_port: u32,
         originator_address: &str,
         originator_port: u32,
-        _session: &mut client::Session,
+        session: &mut client::Session,
     ) -> std::result::Result<(), Self::Error> {
         info!(
             "Received forwarded-tcpip channel: {}:{} <- {}:{}",
@@ -165,15 +170,16 @@ impl client::Handler for SshClient {
 
         // Send the channel to the handler if we have a sender
         if let Some(ref tx) = self.forwarded_tcpip_tx {
-            if let Err(e) = tx.send(channel) {
-                error!("Failed to send forwarded-tcpip channel: {}", e);
-                return Err(AppError::PortForwardingError(
-                    "Failed to send forwarded channel".to_string(),
-                ));
+            if let Err(e) = tx.try_send(channel) {
+                // This callback runs on the SSH transport loop. Waiting for space
+                // here would also stop existing channels from making progress.
+                session.close(e.into_inner().id())?;
+                return Ok(());
             }
             info!("Forwarded channel sent to handler");
         } else {
             warn!("Received forwarded-tcpip channel but no handler is registered");
+            session.close(channel.id())?;
         }
 
         Ok(())
@@ -181,10 +187,8 @@ impl client::Handler for SshClient {
 }
 
 pub struct SshSession {
+    terminal: remote_core::terminal::Terminal,
     session: Arc<tokio::sync::Mutex<Option<client::Handle<SshClient>>>>,
-    r: Option<russh::ChannelReadHalf>,
-    w: russh::ChannelWriteHalf<client::Msg>,
-    server_key: Arc<OnceCell<String>>,
 }
 
 impl SshSession {
@@ -192,7 +196,7 @@ impl SshSession {
         connection: &Connection,
         timeout: Option<Duration>,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(client::Handle<SshClient>, Arc<OnceCell<String>>)> {
+    ) -> Result<client::Handle<SshClient>> {
         Self::new_session_with_timeout_and_forwarding(connection, timeout, cancel, None).await
     }
 
@@ -201,8 +205,8 @@ impl SshSession {
         connection: &Connection,
         timeout: Option<Duration>,
         cancel: &tokio_util::sync::CancellationToken,
-        forwarded_tcpip_tx: Option<tokio::sync::mpsc::UnboundedSender<Channel<client::Msg>>>,
-    ) -> Result<(client::Handle<SshClient>, Arc<OnceCell<String>>)> {
+        forwarded_tcpip_tx: Option<mpsc::Sender<Channel<client::Msg>>>,
+    ) -> Result<client::Handle<SshClient>> {
         info!(
             "Initiating SSH connection to {}@{}",
             connection.username,
@@ -230,10 +234,8 @@ impl SshSession {
         };
 
         let config = Arc::new(config);
-        let server_key = Arc::new(OnceCell::new());
         let ssh_client = SshClient {
             connection: connection.clone(),
-            server_key: server_key.clone(),
             forwarded_tcpip_tx,
         };
 
@@ -249,7 +251,7 @@ impl SshSession {
 
         Self::authenticate_session(&mut session, connection).await?;
 
-        Ok((session, server_key))
+        Ok(session)
     }
 
     pub(crate) async fn setup_sftp_session(
@@ -261,15 +263,16 @@ impl SshSession {
         let channel = match channel {
             Some(channel) => channel,
             None => {
-                let (session, _server_key) =
-                    Self::new_session_with_timeout(connection, timeout, cancel).await?;
+                let session = Self::new_session_with_timeout(connection, timeout, cancel).await?;
 
                 session.channel_open_session().await?
             }
         };
-        channel.request_subsystem(true, "sftp").await?;
+        Self::open_sftp_channel(channel).await
+    }
 
-        // Create RawSftpSession for better performance
+    pub(crate) async fn open_sftp_channel(channel: Channel<client::Msg>) -> Result<RawSftpSession> {
+        channel.request_subsystem(true, "sftp").await?;
         let sftp = RawSftpSession::new(channel.into_stream());
 
         // Initialize the SFTP session
@@ -513,24 +516,25 @@ impl SshSession {
     }
 
     fn resolve_private_key_path(private_key_path: &str) -> Result<PathBuf> {
+        let home = || {
+            #[cfg(not(test))]
+            let path = dirs::home_dir();
+            #[cfg(test)]
+            let path = TEST_SSH_HOME.try_with(Clone::clone).ok();
+            path.ok_or_else(|| {
+                AppError::SshConnectionError("Could not determine home directory".into())
+            })
+        };
         if let Some(stripped) = private_key_path.strip_prefix("~/") {
-            let home = dirs::home_dir().ok_or_else(|| {
-                AppError::SshConnectionError("Could not determine home directory".to_string())
-            })?;
-            Ok(home.join(stripped))
+            Ok(home()?.join(stripped))
         } else if private_key_path == "~" {
-            let home = dirs::home_dir().ok_or_else(|| {
-                AppError::SshConnectionError("Could not determine home directory".to_string())
-            })?;
-            Ok(home)
+            home()
         } else {
             Ok(PathBuf::from(private_key_path))
         }
     }
 
-    pub(crate) async fn new_session(
-        connection: &Connection,
-    ) -> Result<(client::Handle<SshClient>, Arc<OnceCell<String>>)> {
+    pub(crate) async fn new_session(connection: &Connection) -> Result<client::Handle<SshClient>> {
         Self::new_session_with_timeout(
             connection,
             None,
@@ -565,7 +569,9 @@ impl SshSession {
         (cancel_token, rx)
     }
 
-    async fn connect_with_cancel(
+    /// Open a device PTY with the same Host Key and authentication policy used
+    /// by the interactive client. A cancellation or timeout drops the attempt.
+    pub async fn connect_with_cancel(
         connection: &Connection,
         cols: u16,
         rows: u16,
@@ -575,23 +581,13 @@ impl SshSession {
         let timeout = timeout.unwrap_or(Duration::from_secs(10));
 
         let f = async {
-            let (session, server_key) =
-                Self::new_session_with_timeout(connection, Some(timeout), cancel).await?;
+            let session = Self::new_session_with_timeout(connection, Some(timeout), cancel).await?;
 
             debug!("Opening SSH session channel");
             let channel = session.channel_open_session().await?;
             info!("Requesting PTY with size {} cols x {} rows", cols, rows);
 
-            let _ = channel.set_env(false, "LC_CTYPE", "C.UTF-8").await;
-
-            channel
-                .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
-                .await?;
-
-            debug!("Requesting shell");
-            channel.request_shell(true).await?;
-
-            let (r, w) = channel.split();
+            let terminal = remote_core::terminal::Terminal::open(channel, cols, rows, None).await?;
 
             info!(
                 "SSH session established successfully to {}",
@@ -599,10 +595,8 @@ impl SshSession {
             );
 
             Ok::<Self, AppError>(Self {
+                terminal,
                 session: Arc::new(tokio::sync::Mutex::new(Some(session))),
-                r: Some(r),
-                w,
-                server_key,
             })
         };
 
@@ -627,29 +621,12 @@ impl SshSession {
         // channel operations don't need the session handle.
         let channel = session_handle.lock().await.channel_open_session().await?;
 
-        let _ = channel.set_env(false, "LC_CTYPE", "C.UTF-8").await;
-        channel
-            .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
-            .await?;
-
-        match start_dir {
-            Some(dir) => {
-                let escaped = dir.replace('\'', "'\\''");
-                let cmd = format!("cd '{}' && exec $SHELL -l", escaped);
-                channel.exec(true, cmd.as_bytes()).await?;
-            }
-            None => {
-                channel.request_shell(true).await?;
-            }
-        }
-
-        let (r, w) = channel.split();
+        let terminal =
+            remote_core::terminal::Terminal::open(channel, cols, rows, start_dir).await?;
 
         Ok(Self {
+            terminal,
             session: Arc::new(tokio::sync::Mutex::new(None)),
-            r: Some(r),
-            w,
-            server_key: Arc::new(OnceCell::new()),
         })
     }
 
@@ -665,14 +642,17 @@ impl SshSession {
     }
 
     pub async fn request_size(&self, cols: u16, rows: u16) {
-        let _ = self.w.window_change(cols as u32, rows as u32, 0, 0).await;
+        let _ = self.resize(cols, rows).await;
+    }
+
+    /// Unlike the compatibility notification, reports a closed PTY to the caller.
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.terminal.resize(cols, rows).await?;
+        Ok(())
     }
 
     pub async fn write_all(&self, data: &[u8]) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-        let mut writer = self.w.make_writer();
-
-        match writer.write_all(data).await {
+        match self.terminal.write(data).await {
             Ok(_) => Ok(()),
             Err(e) => match e.kind() {
                 std::io::ErrorKind::BrokenPipe
@@ -687,53 +667,67 @@ impl SshSession {
         }
     }
 
+    pub fn id(&self) -> remote_core::SessionId {
+        self.terminal.id()
+    }
+
+    pub fn take_output(&mut self) -> Option<remote_core::terminal::Output> {
+        self.terminal.take_output()
+    }
+
     /// Take the reader from this session. Returns `None` if already taken.
     /// The reader should be passed to `read_loop` in a separate task.
     pub fn take_reader(&mut self) -> Option<russh::ChannelReadHalf> {
-        self.r.take()
+        self.take_output()
+            .map(remote_core::terminal::Output::into_raw)
+    }
+
+    pub(crate) fn start_reader<B: ByteProcessor + Send + 'static>(
+        &mut self,
+        buffer: Arc<tokio::sync::Mutex<B>>,
+        events: Option<tokio::sync::mpsc::Sender<crate::AppEvent>>,
+    ) -> CancellationToken {
+        let reader = self.take_output().expect("terminal reader already started");
+        let cancel = CancellationToken::new();
+        tokio::spawn(Self::read_loop(
+            reader,
+            buffer,
+            cancel.clone(),
+            events.map(|tx| (self.id(), tx)),
+        ));
+        cancel
     }
 
     /// Read loop that processes incoming SSH channel messages.
     /// Takes ownership of the reader and uses stream-based iteration with cancellation support.
     pub(crate) async fn read_loop<B: ByteProcessor>(
-        reader: russh::ChannelReadHalf,
+        mut reader: remote_core::terminal::Output,
         processor: Arc<tokio::sync::Mutex<B>>,
         cancel: tokio_util::sync::CancellationToken,
-        event_tx: Option<tokio::sync::mpsc::Sender<crate::AppEvent>>,
+        events: Option<(
+            remote_core::SessionId,
+            tokio::sync::mpsc::Sender<crate::AppEvent>,
+        )>,
     ) {
-        use futures::stream::{self, StreamExt};
-
-        // Create a stream from the reader using unfold
-        let msg_stream =
-            stream::unfold(
-                reader,
-                |mut r| async move { r.wait().await.map(|msg| (msg, r)) },
-            );
-
-        // Take messages until cancellation
-        let mut msg_stream = std::pin::pin!(msg_stream.take_until(cancel.cancelled()));
-
-        while let Some(msg) = msg_stream.next().await {
-            match msg {
-                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                    let mut guard = processor.lock().await;
-                    guard.process_bytes(&data);
-                    drop(guard); // Release lock before sending event
-
-                    // Notify event loop that terminal has updates (event-driven refresh)
-                    if let Some(tx) = &event_tx {
-                        let _ = tx.send(crate::AppEvent::TerminalUpdate).await;
-                    }
+        loop {
+            let data = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                data = reader.read() => match data { Some(bytes) => bytes, None => break },
+            };
+            processor.lock().await.process_bytes(&data);
+            if let Some((id, tx)) = &events {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    sent = tx.send(crate::AppEvent::TerminalUpdate(*id)) => if sent.is_err() { return; },
                 }
-                ChannelMsg::Eof | ChannelMsg::Close | ChannelMsg::ExitStatus { .. } => {
-                    // Notify the main loop that the connection has been disconnected
-                    if let Some(tx) = &event_tx {
-                        let _ = tx.send(crate::AppEvent::Disconnect).await;
-                    }
-                    break;
-                }
-                _ => {}
             }
+        }
+        // Transport loss can end the stream without delivering a channel Close.
+        if !cancel.is_cancelled()
+            && let Some((id, tx)) = events
+        {
+            let _ = tx.send(crate::AppEvent::Disconnect(id)).await;
         }
     }
 
@@ -760,13 +754,8 @@ impl SshSession {
 
     #[allow(dead_code)]
     pub async fn close_channel(&self) -> Result<()> {
-        self.w.close().await?;
+        self.terminal.close().await?;
         Ok(())
-    }
-
-    /// Get the server public key that was received during connection
-    pub fn get_server_key(&self) -> Option<&str> {
-        self.server_key.get().map(|s| s.as_str())
     }
 
     pub(crate) async fn sftp_send_file_with_timeout(
@@ -780,19 +769,27 @@ impl SshSession {
     ) -> Result<()> {
         // Setup SFTP session
         let sftp = Self::setup_sftp_session(channel, connection, timeout, cancel).await?;
-        progress_reporter.report_progress(0);
+        let meta = from.file_metadata().await.unwrap_or_else(|e| {
+            warn!("Failed to read source file permissions, using server defaults: {e}");
+            HostFileMetadata::default()
+        });
+        Self::send_sftp(sftp, from, meta, to, cancel, progress_reporter).await
+    }
 
-        let file_attrs = match from.file_metadata().await {
-            Ok(meta) => FileAttributes {
-                permissions: meta.permissions,
-                ..FileAttributes::empty()
-            },
-            Err(e) => {
-                warn!("Failed to read source file permissions, using server defaults: {e}");
-                FileAttributes::empty()
-            }
+    pub(crate) async fn send_sftp(
+        sftp: RawSftpSession,
+        from: impl HostFile,
+        meta: HostFileMetadata,
+        to: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+        progress_reporter: impl ProgressReporter,
+    ) -> Result<()> {
+        let file_attrs = FileAttributes {
+            permissions: meta.permissions,
+            ..FileAttributes::empty()
         };
-
+        progress_reporter.set_total_bytes(meta.size);
+        progress_reporter.report_progress(0);
         // Open remote file for writing
         let remote_handle = sftp
             .open(
@@ -847,7 +844,7 @@ impl SshSession {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    return Err(AppError::SftpError("File transfer cancelled by user".to_string()));
+                    return Err(AppError::TransferCancelled);
                 }
                 result = write_stream.next() => {
                     match result {
@@ -888,9 +885,7 @@ impl SshSession {
                 e
             })?;
 
-        let file_size = local_file.file_metadata().await.map(|m| m.size);
-
-        let progress_reporter = TxProgressReporter::new(progress, file_index, file_size.ok());
+        let progress_reporter = TxProgressReporter::new(progress, file_index, None);
 
         let result = Self::sftp_send_file_with_timeout(
             channel,
@@ -926,8 +921,22 @@ impl SshSession {
         // Setup SFTP session
         let sftp = Self::setup_sftp_session(channel, connection, timeout, cancel).await?;
 
+        Self::receive_sftp(sftp, from, to, cancel, progress_reporter).await
+    }
+
+    pub(crate) async fn receive_sftp(
+        sftp: RawSftpSession,
+        from: &str,
+        to: impl HostFile,
+        cancel: &tokio_util::sync::CancellationToken,
+        progress_reporter: impl ProgressReporter,
+    ) -> Result<()> {
         // Query remote file size for progress reporting
-        let file_size = sftp.stat(from).await.ok().map(|attrs| attrs.attrs.len());
+        let file_size = sftp
+            .stat(from)
+            .await
+            .ok()
+            .and_then(|attrs| attrs.attrs.size);
         progress_reporter.set_total_bytes(file_size);
         progress_reporter.report_progress(0);
 
@@ -966,7 +975,7 @@ impl SshSession {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    return Err(AppError::SftpError("File transfer cancelled by user".to_string()));
+                    return Err(AppError::TransferCancelled);
                 }
                 chunk = data_stream.next() => {
                     match chunk {
@@ -1127,7 +1136,7 @@ impl SshSession {
             "Setting up port forwarding: {}:{} -> {}:{}",
             local_addr, local_port, service_host, service_port
         );
-        let (session, _) = Self::new_session(connection).await?;
+        let session = Self::new_session(connection).await?;
         let cancel_token = CancellationToken::new();
         let cancel_token_for_task = cancel_token.clone();
 
@@ -1187,7 +1196,7 @@ impl SshSession {
                                             if should_recreate && attempts < 3 {
                                                 debug!("Attempting to recreate SSH session for port forwarding (attempt {})", attempts + 1);
                                                 match Self::new_session(&connection).await {
-                                                    Ok((new_session, _)) => {
+                                                    Ok(new_session) => {
                                                         info!("SSH session recreated successfully for port forwarding");
                                                         session = new_session;
                                                         attempts += 1;
@@ -1256,13 +1265,13 @@ impl SshSession {
         );
 
         // Create channel for receiving forwarded connections
-        let (forwarded_tx, forwarded_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (forwarded_tx, forwarded_rx) = mpsc::channel(REMOTE_FORWARD_BACKLOG);
 
         let cancel_token = CancellationToken::new();
         let cancel_token_for_session = cancel_token.clone();
 
         // Create a new session with forwarding channel
-        let (mut session, _) = Self::new_session_with_timeout_and_forwarding(
+        let mut session = Self::new_session_with_timeout_and_forwarding(
             connection,
             None,
             &cancel_token_for_session,
@@ -1335,6 +1344,9 @@ impl SshSession {
         let local_addr = local_addr.to_string();
         let connection = connection.clone();
 
+        // Check the host before reporting the listener ready. The first SOCKS
+        // client reuses this SSH session rather than repeating authentication.
+        let mut initial_session = Some(Self::new_session(&connection).await?);
         let local_listener = match TcpListener::bind((local_addr.as_str(), local_port)).await {
             Ok(listener) => {
                 info!("SOCKS5 proxy listening on {}:{}", local_addr, local_port);
@@ -1365,6 +1377,7 @@ impl SshSession {
 
                                 let cancel_for_connection = cancel_token_for_task.clone();
                                 let connection_clone = connection.clone();
+                                let session = initial_session.take();
 
                                 // Handle SOCKS5 connection in a separate task
                                 // Each connection gets its own SSH session
@@ -1373,6 +1386,7 @@ impl SshSession {
                                         local_socket,
                                         cancel_for_connection,
                                         connection_clone,
+                                        session,
                                     ).await {
                                         debug!("SOCKS5 connection error: {}", e);
                                     }
@@ -1400,7 +1414,7 @@ struct RemoteForwardingHandler {
     remote_bind: String,
     remote_port: u16,
     cancel_token: CancellationToken,
-    forwarded_rx: tokio::sync::mpsc::UnboundedReceiver<Channel<client::Msg>>,
+    forwarded_rx: mpsc::Receiver<Channel<client::Msg>>,
 }
 
 impl RemoteForwardingHandler {
@@ -1411,6 +1425,7 @@ impl RemoteForwardingHandler {
             self.service_host, self.service_port
         );
 
+        let mut clients = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
@@ -1419,7 +1434,8 @@ impl RemoteForwardingHandler {
                     let _ = self.session.cancel_tcpip_forward(&self.remote_bind, self.remote_port as u32).await;
                     break;
                 }
-                Some(channel) = self.forwarded_rx.recv() => {
+                _ = clients.join_next(), if !clients.is_empty() => {}
+                Some(channel) = self.forwarded_rx.recv(), if clients.len() < REMOTE_FORWARD_CONNECTIONS => {
                     info!("Received forwarded connection, spawning handler");
 
                     // Clone what we need for the connection handler
@@ -1427,7 +1443,7 @@ impl RemoteForwardingHandler {
                     let service_port = self.service_port;
 
                     // Handle each forwarded connection in a separate task
-                    tokio::spawn(async move {
+                    clients.spawn(async move {
                         if let Err(e) = SshSession::handle_remote_forwarded_connection(
                             channel,
                             &service_host,
@@ -1514,9 +1530,12 @@ impl SshSession {
         mut local_socket: TcpStream,
         cancel_token: CancellationToken,
         connection: Connection,
+        initial_session: Option<client::Handle<SshClient>>,
     ) -> Result<()> {
-        // Create a session for this SOCKS5 connection
-        let (mut session, _) = Self::new_session(&connection).await?;
+        let mut session = match initial_session {
+            Some(session) => session,
+            None => Self::new_session(&connection).await?,
+        };
         // SOCKS5 handshake: receive greeting
         let mut buf = [0u8; 2];
         tokio::select! {
@@ -1713,7 +1732,7 @@ impl SshSession {
                             attempts + 1
                         );
                         match Self::new_session(&connection).await {
-                            Ok((new_session, _)) => {
+                            Ok(new_session) => {
                                 info!("SSH session recreated successfully");
                                 session = new_session;
                                 attempts += 1;
@@ -1771,10 +1790,10 @@ impl SshSession {
         session: &client::Handle<SshClient>,
         err: &RusshError,
     ) -> bool {
-        if session.is_closed() {
-            return true;
-        }
+        session.is_closed() || Self::is_transport_error(err)
+    }
 
+    pub(crate) fn is_transport_error(err: &RusshError) -> bool {
         matches!(
             err,
             RusshError::Disconnect
@@ -2193,6 +2212,7 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
 
     #[derive(Clone)]
     struct EmbeddedSshHandler {
+        session_channels: std::collections::HashSet<ChannelId>,
         creds: Arc<TestCredentials>,
         sftp_root: Option<std::path::PathBuf>,
         sftp_buffer: Arc<tokio::sync::Mutex<Vec<u8>>>,
@@ -2209,6 +2229,7 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
             forward_disconnect_count: Option<Arc<AtomicUsize>>,
         ) -> Self {
             Self {
+                session_channels: Default::default(),
                 creds,
                 sftp_root,
                 sftp_buffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2296,9 +2317,10 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
 
         async fn channel_open_session(
             &mut self,
-            _channel: Channel<Msg>,
+            channel: Channel<Msg>,
             _session: &mut Session,
         ) -> std::result::Result<bool, Self::Error> {
+            self.session_channels.insert(channel.id());
             Ok(true)
         }
 
@@ -2383,6 +2405,11 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
             data: &[u8],
             session: &mut Session,
         ) -> std::result::Result<(), Self::Error> {
+            // A direct-tcpip channel already delivers these bytes into its
+            // stream. The toy shell must not echo them into the forwarded protocol.
+            if !self.session_channels.contains(&channel) {
+                return Ok(());
+            }
             let is_sftp = *self.sftp_active.lock().await;
 
             if is_sftp {
@@ -2422,6 +2449,9 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
                 }
             } else if data.eq_ignore_ascii_case(b"pwd\n") {
                 session.data(channel, CryptoVec::from_slice(b"/cae\n"))?;
+            } else if data == b"exit\n" {
+                session.eof(channel)?;
+                session.close(channel)?;
             } else {
                 session.data(channel, CryptoVec::from_slice(data))?;
             }
@@ -2508,13 +2538,56 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
                         None
                     }
                 }
-                17 => {
-                    // SSH_FXP_STAT
+                7 | 8 | 17 => {
+                    // LSTAT, FSTAT (fixture handles are paths), STAT
                     if let Ok((request_id, path)) = Self::parse_stat_request(&packet[1..]) {
                         Self::handle_stat(request_id, &path, sftp_root).await
                     } else {
                         None
                     }
+                }
+                9 | 13 | 18 => {
+                    use russh_sftp::protocol::Packet;
+                    let packet =
+                        Packet::try_from(&mut bytes::Bytes::copy_from_slice(packet)).ok()?;
+                    let (id, result) = match packet {
+                        Packet::Remove(r) => (
+                            r.id,
+                            tokio::fs::remove_file(sftp_root.join(r.filename)).await,
+                        ),
+                        Packet::Rename(r) => (
+                            r.id,
+                            tokio::fs::rename(sftp_root.join(r.oldpath), sftp_root.join(r.newpath))
+                                .await,
+                        ),
+                        Packet::SetStat(r) => {
+                            let path = sftp_root.join(r.path);
+                            let result = async {
+                                let _meta = tokio::fs::metadata(&path).await?;
+                                #[cfg(unix)]
+                                if let Some(mode) = r.attrs.permissions {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    tokio::fs::set_permissions(
+                                        path,
+                                        std::fs::Permissions::from_mode(mode),
+                                    )
+                                    .await?;
+                                }
+                                Ok(())
+                            }
+                            .await;
+                            (r.id, result)
+                        }
+                        _ => unreachable!(),
+                    };
+                    Self::create_error_response(
+                        id,
+                        match result {
+                            Ok(()) => 0,
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => 2,
+                            Err(_) => 4,
+                        },
+                    )
                 }
                 _ => {
                     // Unsupported operation
@@ -2919,21 +2992,372 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         }
     }
 
+    fn test_host_key() -> ssh_key::PublicKey {
+        ssh_key::PrivateKey::from_openssh(TEST_SERVER_KEY)
+            .unwrap()
+            .public_key()
+            .clone()
+    }
+
+    fn test_connection(port: u16, auth: AuthMethod) -> Connection {
+        let mut conn = Connection::new("127.0.0.1".into(), port, "tester".into(), auth);
+        conn.public_key = Some(test_host_key().to_openssh().unwrap());
+        conn
+    }
+
+    async fn next_tunnel_event(
+        events: &mut tokio::sync::mpsc::Receiver<crate::tunnel_home::HomeEvent>,
+    ) -> crate::tunnel_home::HomeEvent {
+        tokio::time::timeout(Duration::from_secs(8), events.recv())
+            .await
+            .unwrap()
+            .expect("tunnel worker ended before event")
+    }
+
+    #[tokio::test]
+    async fn home_tunnel_requires_gateway_pin_before_binding() {
+        use crate::tunnel_home::{HomeEvent, HomeTunnel};
+        let server = EmbeddedSshServer::start("tester", "testerpass")
+            .await
+            .unwrap();
+        let mut conn = test_connection(
+            server.port(),
+            AuthMethod::Password("testerpass".to_owned().into()),
+        );
+        let local = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        assert!(HomeTunnel::start(conn.clone(), "0.0.0.0:6000".parse().unwrap(), 22).is_err());
+        for pin in [None, Some(TEST_CLIENT_PUBLIC_KEY.to_owned())] {
+            let unknown = pin.is_none();
+            conn.public_key = pin;
+            let (tunnel, mut events) = HomeTunnel::start(conn.clone(), local, 22).unwrap();
+            assert!(matches!(
+                next_tunnel_event(&mut events).await,
+                HomeEvent::Connecting
+            ));
+            let HomeEvent::Blocked(error) = next_tunnel_event(&mut events).await else {
+                panic!("Host key failure should block rather than reconnect")
+            };
+            if unknown {
+                let AppError::UnknownHostKey { fingerprint, .. } = error else {
+                    panic!("{error}")
+                };
+                assert_eq!(
+                    fingerprint,
+                    test_host_key()
+                        .fingerprint(ssh_key::HashAlg::Sha256)
+                        .to_string()
+                );
+            } else {
+                assert!(matches!(error, AppError::HostKeyChanged { .. }));
+            }
+            assert!(events.recv().await.is_none());
+            assert!(TcpListener::bind(local).await.is_ok());
+            tunnel.stop().await;
+        }
+        let wrong_password = test_connection(
+            server.port(),
+            AuthMethod::Password("incorrect".to_owned().into()),
+        );
+        let (tunnel, mut events) = HomeTunnel::start(wrong_password, local, 22).unwrap();
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::Connecting
+        ));
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::Blocked(AppError::AuthenticationError(_))
+        ));
+        assert!(TcpListener::bind(local).await.is_ok());
+        tunnel.stop().await;
+    }
+
+    #[tokio::test]
+    async fn home_tunnel_recovers_gateway_then_distinguishes_offline_service() {
+        use crate::tunnel_home::{HomeEvent, HomeTunnel};
+        let server = EmbeddedSshServer::start_with_forward_disconnect("tester", "testerpass")
+            .await
+            .unwrap();
+        let conn = test_connection(
+            server.port(),
+            AuthMethod::Password("testerpass".to_owned().into()),
+        );
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service = reserve.local_addr().unwrap();
+        let local = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (tunnel, mut events) = HomeTunnel::start(conn, local, service.port()).unwrap();
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::Connecting
+        ));
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::Ready
+        ));
+        // The gateway drops the first direct-tcpip attempt, even though authentication worked.
+        drop(TcpStream::connect(local).await.unwrap());
+        let retry = loop {
+            match next_tunnel_event(&mut events).await {
+                HomeEvent::Retrying { seconds, .. } => break seconds,
+                HomeEvent::ServiceUnavailable(_) => continue,
+                event => panic!("Unexpected event: {event:?}"),
+            }
+        };
+        assert_eq!(retry, 1);
+        drop(reserve);
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::Connecting
+        ));
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::Ready
+        ));
+        drop(TcpStream::connect(local).await.unwrap());
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::ServiceUnavailable(_)
+        ));
+
+        // Bring only the service online. The same gateway carries both directions.
+        let upstream = TcpListener::bind(service).await.unwrap();
+        let mut device = TcpStream::connect(local).await.unwrap();
+        let (mut target, _) = tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::Ready
+        ));
+        let mut bytes = [0; 4];
+        device.write_all(b"ping").await.unwrap();
+        target.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ping");
+        target.write_all(b"pong").await.unwrap();
+        device.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"pong");
+        tunnel.stop().await;
+        assert!(matches!(
+            next_tunnel_event(&mut events).await,
+            HomeEvent::Stopped
+        ));
+        assert_eq!(device.read(&mut bytes).await.unwrap(), 0);
+        assert!(TcpListener::bind(local).await.is_ok());
+        assert_eq!(server.forward_disconnect_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_key_gate_blocks_unknown_changed_and_invalid_pins() {
+        let server = EmbeddedSshServer::start("tester", "testerpass")
+            .await
+            .unwrap();
+        let mut conn = test_connection(
+            server.port(),
+            AuthMethod::Password("testerpass".to_string().into()),
+        );
+        let fingerprint = test_host_key()
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
+        conn.public_key = None;
+        let Err(AppError::UnknownHostKey {
+            public_key,
+            fingerprint: observed,
+        }) = SshSession::connect(&conn, 80, 24).await
+        else {
+            panic!("untrusted host should request confirmation")
+        };
+        assert_eq!(observed, fingerprint);
+        assert_eq!(
+            ssh_key::PublicKey::from_openssh(&public_key)
+                .unwrap()
+                .key_data(),
+            test_host_key().key_data()
+        );
+
+        // Model the reconnect after the user has confirmed the observed key.
+        conn.public_key = Some(format!("{public_key} workstation"));
+        SshSession::connect(&conn, 80, 24)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+
+        conn.public_key = Some(TEST_CLIENT_PUBLIC_KEY.to_string()); // valid but different pin
+        let Err(AppError::HostKeyChanged {
+            expected, received, ..
+        }) = SshSession::connect(&conn, 80, 24).await
+        else {
+            panic!("a changed key must be a hard failure")
+        };
+        assert_eq!(received, fingerprint);
+        assert_ne!(expected, received);
+
+        conn.public_key = Some("invalid pin".into());
+        assert!(matches!(
+            SshSession::connect(&conn, 80, 24).await,
+            Err(AppError::SshPublicKeyValidationError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_forward_confirms_in_place_before_binding() {
+        use crate::key_event::{
+            KeyFlow, handle_port_forwarding_list_key, port_forwarding::start_forward,
+        };
+        use crate::{App, AppMode};
+        use crossterm::event::KeyCode;
+        use ratatui::{
+            Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect,
+        };
+
+        async fn enter(app: &mut App<CrosstermBackend<Vec<u8>>>) {
+            match handle_port_forwarding_list_key(app, KeyCode::Enter.into()).await {
+                KeyFlow::StartForward(rule) => start_forward(app, &rule).await,
+                KeyFlow::Continue => {}
+                _ => panic!("unexpected action in port-forward list"),
+            }
+        }
+
+        let server = EmbeddedSshServer::start("tester", "testerpass")
+            .await
+            .unwrap();
+        let mut conn = test_connection(
+            server.port(),
+            AuthMethod::Password("testerpass".to_string().into()),
+        );
+        conn.public_key = None;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = CrosstermBackend::new(Vec::new());
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut app =
+            App::with_config_path(terminal, Some(&dir.path().join("config.toml"))).unwrap();
+        let addr = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let rule = PortForward::new(
+            conn.id.clone(),
+            PortForwardType::Dynamic,
+            "127.0.0.1".into(),
+            addr.port(),
+            String::new(),
+            0,
+            None,
+            None,
+        );
+        app.config.add_connection(conn).unwrap();
+        app.config.add_port_forward(rule.clone()).unwrap();
+        app.go_to_port_forwarding_list().await;
+
+        enter(&mut app).await;
+        assert!(matches!(app.mode, AppMode::VerifyHostKey { .. }));
+        assert!(
+            TcpListener::bind(addr).await.is_ok(),
+            "untrusted listener must not bind"
+        );
+        app.handle_host_key(KeyCode::Esc.into());
+        assert!(matches!(app.mode, AppMode::PortForwardingList(_)));
+        assert!(app.config.connections()[0].public_key.is_none());
+
+        enter(&mut app).await;
+        let AppMode::VerifyHostKey { visible, .. } = &mut app.mode else {
+            panic!("confirmation missing")
+        };
+        *visible = true;
+        app.handle_host_key(KeyCode::Char('y').into());
+        assert!(matches!(app.mode, AppMode::PortForwardingList(_)));
+        assert!(app.config.connections()[0].public_key.is_some());
+        assert!(
+            TcpListener::bind(addr).await.is_ok(),
+            "confirmation must not start the rule"
+        );
+        enter(&mut app).await;
+        assert!(app.port_forwarding_runtime.is_running(&rule.id).await);
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut greeting = [0; 2];
+        tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut greeting))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(greeting, [5, 0]);
+        drop(client);
+
+        // Stopping never needs a valid pin; the next start must re-check the peer.
+        app.config.connections_mut()[0].public_key = Some("malformed".into());
+        enter(&mut app).await;
+        assert!(!app.port_forwarding_runtime.is_running(&rule.id).await);
+        app.config.connections_mut()[0].public_key = Some(TEST_CLIENT_PUBLIC_KEY.into());
+        enter(&mut app).await;
+        assert!(matches!(app.error, Some(AppError::HostKeyChanged { .. })));
+        assert!(TcpListener::bind(addr).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn headless_terminal_uses_the_same_core_pty_as_the_workspace() {
+        let server = EmbeddedSshServer::start("tester", "testerpass")
+            .await
+            .unwrap();
+        let conn = test_connection(
+            server.port(),
+            AuthMethod::Password("testerpass".to_owned().into()),
+        );
+        let cancel = CancellationToken::new();
+        let mut terminal =
+            crate::session::SshSession::connect_with_cancel(&conn, 80, 24, None, &cancel)
+                .await
+                .unwrap();
+        let mut output = terminal.take_output().unwrap();
+        assert_eq!(output.id(), terminal.id());
+        terminal.resize(96, 32).await.unwrap();
+        terminal.write_all(b"pwd\n").await.unwrap();
+        let mut text = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(chunk) = output.read().await {
+                text.extend_from_slice(&chunk);
+                if text.windows(5).any(|s| s == b"/cae\n") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(text.windows(5).any(|s| s == b"/cae\n"));
+        terminal.close().await.unwrap();
+        drop(terminal);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while output.read().await.is_some() {}
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn test_connect_embedded_server() {
         let server = EmbeddedSshServer::start("tester", "testerpass")
             .await
             .expect("failed to start embedded server");
         let port = server.port();
-        let conn = Connection::new(
-            "127.0.0.1".to_string(),
-            port,
-            "tester".to_string(),
-            AuthMethod::Password("testerpass".to_string().into()),
-        );
+        let conn = test_connection(port, AuthMethod::Password("testerpass".to_string().into()));
         let mut client = SshSession::connect(&conn, 80, 24).await.unwrap();
 
-        let reader = client.take_reader().expect("reader already taken");
+        let reader = client.take_output().expect("reader already taken");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel_token.clone();
         let processor = Arc::new(tokio::sync::Mutex::new(
@@ -2971,12 +3395,134 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
     }
 
     #[tokio::test]
+    async fn three_live_tabs_keep_their_buffers_when_a_background_shell_exits() {
+        use crate::key_event::{handle_key_event, handle_paste_event};
+        use crate::ui::TerminalState;
+        use crossterm::event::KeyCode;
+        use ratatui::{
+            Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect,
+        };
+        type Buffer = Arc<tokio::sync::Mutex<TerminalState>>;
+
+        async fn has(buffer: &Buffer, marker: &str) -> bool {
+            let guard = buffer.lock().await;
+            let screen = guard.terminal.screen();
+            screen
+                .lines_in_phys_range(0..screen.scrollback_rows())
+                .iter()
+                .any(|line| {
+                    line.visible_cells()
+                        .map(|cell| cell.str().to_owned())
+                        .collect::<String>()
+                        .contains(marker)
+                })
+        }
+
+        let server = EmbeddedSshServer::start("tester", "testerpass")
+            .await
+            .unwrap();
+        let conn = test_connection(
+            server.port(),
+            AuthMethod::Password("testerpass".to_string().into()),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = Terminal::with_options(
+            CrosstermBackend::new(Vec::<u8>::new()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut app =
+            crate::App::with_config_path(terminal, Some(&dir.path().join("test.toml"))).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let mut tabs = Vec::new();
+
+        for (i, marker) in ["only-A", "only-B", "only-C"].iter().enumerate() {
+            let mut client = SshSession::connect(&conn, 80, 23).await.unwrap();
+            let buffer = Arc::new(tokio::sync::Mutex::new(TerminalState::new_with_scrollback(
+                23, 80, 128,
+            )));
+            let cancel = client.start_reader(buffer.clone(), Some(tx.clone()));
+            tabs.push((client.id(), buffer.clone()));
+            // All three tabs have the SAME display name and connection profile.
+            app.go_to_connected("loopback".into(), client, buffer, 0, cancel);
+            handle_paste_event(&mut app, marker).await;
+            if i < 2 {
+                handle_key_event(&mut app, KeyCode::F(12).into()).await;
+            }
+        }
+        assert_eq!(app.terminal_count(), 3);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (i, (_, buffer)) in tabs.iter().enumerate() {
+                let marker = ["only-A", "only-B", "only-C"][i];
+                while !has(buffer, marker).await {
+                    rx.recv().await.unwrap();
+                }
+            }
+        })
+        .await
+        .expect("all three terminals should receive their own echo");
+        for (i, (_, buffer)) in tabs.iter().enumerate() {
+            for (j, marker) in ["only-A", "only-B", "only-C"].iter().enumerate() {
+                assert_eq!(has(buffer, marker).await, i == j);
+            }
+        }
+
+        for i in [0, 1] {
+            handle_key_event(&mut app, KeyCode::F(6).into()).await;
+            assert_eq!(app.active_terminal_id(), Some(tabs[i].0));
+        }
+        handle_paste_event(&mut app, "exit\n").await;
+        handle_key_event(&mut app, KeyCode::F(6).into()).await;
+        assert_eq!(app.active_terminal_id(), Some(tabs[2].0));
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(crate::AppEvent::Disconnect(id)) = rx.recv().await {
+                    break id;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(closed, tabs[1].0);
+        app.remote_disconnect(closed).await;
+        app.remote_disconnect(closed).await; // delayed duplicate after tab removal
+        assert_eq!(app.terminal_count(), 2);
+        assert_eq!(app.active_terminal_id(), Some(tabs[2].0));
+        assert_eq!(
+            app.last_terminal_notice(),
+            Some(format!("#{closed} loopback disconnected").as_str())
+        );
+        for i in [2, 0] {
+            handle_paste_event(&mut app, "-alive").await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !has(&tabs[i].1, "-alive").await {
+                    rx.recv().await.unwrap();
+                }
+            })
+            .await
+            .expect("surviving SSH transport must still accept input");
+            handle_key_event(&mut app, KeyCode::F(6).into()).await;
+        }
+        handle_key_event(&mut app, KeyCode::F(8).into()).await;
+        assert_eq!(app.active_terminal_id(), Some(tabs[0].0));
+        handle_key_event(&mut app, KeyCode::F(12).into()).await;
+        assert_eq!(app.active_terminal_id(), None);
+        handle_key_event(&mut app, KeyCode::F(1).into()).await;
+        assert_eq!(app.active_terminal_id(), Some(tabs[0].0));
+        handle_key_event(&mut app, KeyCode::F(8).into()).await;
+        assert_eq!(app.terminal_count(), 0);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_connect_embedded_server_public_key() {
         use std::io::Write;
 
         // Create a temporary file for the private key
-        let temp_dir = std::env::temp_dir();
-        let key_path = temp_dir.join("test_ssh_key");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("test_ssh_key");
         let mut key_file = std::fs::File::create(&key_path).unwrap();
         key_file
             .write_all(TEST_CLIENT_PRIVATE_KEY.as_bytes())
@@ -3001,10 +3547,8 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         .expect("failed to start embedded server");
         let port = server.port();
 
-        let conn = Connection::new(
-            "127.0.0.1".to_string(),
+        let conn = test_connection(
             port,
-            "tester".to_string(),
             AuthMethod::PublicKey {
                 private_key_path: key_path.to_string_lossy().to_string(),
                 passphrase: None,
@@ -3012,7 +3556,7 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         );
         let mut client = SshSession::connect(&conn, 80, 24).await.unwrap();
 
-        let reader = client.take_reader().expect("reader already taken");
+        let reader = client.take_output().expect("reader already taken");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel_token.clone();
         let processor = Arc::new(tokio::sync::Mutex::new(
@@ -3047,9 +3591,6 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         client.close().await.unwrap();
 
         server.shutdown().await.unwrap();
-
-        // Clean up the temporary key file
-        let _ = std::fs::remove_file(key_path);
     }
 
     #[tokio::test]
@@ -3057,11 +3598,10 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         use std::io::Write;
 
         // Create a temporary directory for SSH keys
-        let temp_dir = std::env::temp_dir().join("test_ssh_auto_load");
-        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
 
         // Create a fake .ssh directory structure
-        let ssh_dir = temp_dir.join(".ssh");
+        let ssh_dir = temp_dir.path().join(".ssh");
         std::fs::create_dir_all(&ssh_dir).unwrap();
 
         // Write one of the standard keys (id_ed25519) to the temp location
@@ -3081,12 +3621,6 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
             std::fs::set_permissions(&key_path, perms).unwrap();
         }
 
-        // Temporarily override HOME to point to our temp dir
-        let original_home = std::env::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", &temp_dir);
-        }
-
         // Start the test server with public key auth
         let server = EmbeddedSshServer::start_with_auth(
             "tester",
@@ -3098,17 +3632,17 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         let port = server.port();
 
         // Create connection with AutoLoadKey
-        let conn = Connection::new(
-            "127.0.0.1".to_string(),
-            port,
-            "tester".to_string(),
-            AuthMethod::AutoLoadKey,
-        );
+        let conn = test_connection(port, AuthMethod::AutoLoadKey);
 
-        // Test connection
-        let mut client = SshSession::connect(&conn, 80, 24).await.unwrap();
+        let mut client = TEST_SSH_HOME
+            .scope(
+                temp_dir.path().to_owned(),
+                SshSession::connect(&conn, 80, 24),
+            )
+            .await
+            .unwrap();
 
-        let reader = client.take_reader().expect("reader already taken");
+        let reader = client.take_output().expect("reader already taken");
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel_token.clone();
         let processor = Arc::new(tokio::sync::Mutex::new(
@@ -3134,18 +3668,6 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         }
         client.close().await.unwrap();
         server.shutdown().await.unwrap();
-
-        // Restore original HOME
-        unsafe {
-            if let Some(home) = original_home {
-                std::env::set_var("HOME", home);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-
-        // Clean up
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
@@ -3269,6 +3791,126 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
     }
 
     #[tokio::test]
+    async fn headless_file_copy_roundtrip_cancel_and_failure_preserve_target() {
+        use crate::files::{FileLocation::Local, FileProgress, SftpEndpoint, copy_file};
+        use std::cell::Cell;
+        use tokio_util::sync::CancellationToken;
+
+        let server = EmbeddedSshServer::start_with_sftp("tester", "testerpass")
+            .await
+            .unwrap();
+        let conn = test_connection(
+            server.port(),
+            AuthMethod::Password("testerpass".to_owned().into()),
+        );
+        let cancel = CancellationToken::new();
+        let peer = SftpEndpoint::connect(&conn, Duration::from_secs(5), &cancel)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("输入 file.bin");
+        let dst = dir.path().join("output.bin");
+        let remote = "远程 file.bin";
+        let data: Vec<_> = (0..CHUNK_SIZE * 3 + 7).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+        let last = Cell::new(None);
+        copy_file(Local(&src), peer.file(remote), &cancel, |p| {
+            last.set(Some(p))
+        })
+        .await
+        .unwrap();
+        let done = Some(FileProgress {
+            transferred: data.len() as u64,
+            total: Some(data.len() as u64),
+        });
+        assert_eq!(last.take(), done);
+        assert_eq!(
+            std::fs::read(server.temp_dir().unwrap().join(remote)).unwrap(),
+            data
+        );
+        copy_file(peer.file(remote), Local(&dst), &cancel, |p| {
+            last.set(Some(p))
+        })
+        .await
+        .unwrap();
+        assert_eq!(last.take(), done);
+        assert_eq!(std::fs::read(&dst).unwrap(), data);
+
+        std::fs::write(&dst, b"previous contents").unwrap();
+        let stop = CancellationToken::new();
+        let cancelled = copy_file(peer.file(remote), Local(&dst), &stop, |p| {
+            if p.transferred > 0 {
+                stop.cancel();
+            }
+        })
+        .await;
+        assert!(matches!(cancelled, Err(AppError::TransferCancelled)));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"previous contents");
+        let missing = copy_file(peer.file("missing.bin"), Local(&dst), &cancel, |_| {}).await;
+        assert!(matches!(missing, Err(ref e) if !matches!(e, AppError::TransferCancelled)));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"previous contents");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        let remote_target = server.temp_dir().unwrap().join(remote);
+        std::fs::write(&remote_target, b"previous remote contents").unwrap();
+        let stop = CancellationToken::new();
+        let cancelled = copy_file(Local(&src), peer.file(remote), &stop, |p| {
+            if p.transferred > 0 {
+                stop.cancel();
+            }
+        })
+        .await;
+        assert!(
+            matches!(cancelled, Err(AppError::TransferCancelled)),
+            "{cancelled:?}"
+        );
+        assert_eq!(
+            std::fs::read(&remote_target).unwrap(),
+            b"previous remote contents"
+        );
+        assert_eq!(
+            std::fs::read_dir(server.temp_dir().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        drop(peer);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn headless_file_copy_between_two_sftp_devices() {
+        use crate::files::{SftpEndpoint, copy_file};
+        use tokio_util::sync::CancellationToken;
+        let cancel = CancellationToken::new();
+        let a = EmbeddedSshServer::start_with_sftp("tester", "testerpass")
+            .await
+            .unwrap();
+        let b = EmbeddedSshServer::start_with_sftp("tester", "testerpass")
+            .await
+            .unwrap();
+        let conn =
+            |port| test_connection(port, AuthMethod::Password("testerpass".to_owned().into()));
+        let source = SftpEndpoint::connect(&conn(a.port()), Duration::from_secs(5), &cancel)
+            .await
+            .unwrap();
+        let dest = SftpEndpoint::connect(&conn(b.port()), Duration::from_secs(5), &cancel)
+            .await
+            .unwrap();
+        let path = "两台设备.txt";
+        std::fs::write(a.temp_dir().unwrap().join(path), b"device A").unwrap();
+        copy_file(source.file(path), dest.file(path), &cancel, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(b.temp_dir().unwrap().join(path)).unwrap(),
+            b"device A"
+        );
+        drop((source, dest));
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_sftp_send_large_file() {
         let server = EmbeddedSshServer::start_with_sftp("tester", "testerpass")
             .await
@@ -3276,12 +3918,7 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         let port = server.port();
         let temp_dir = server.temp_dir().unwrap();
 
-        let conn = Connection::new(
-            "127.0.0.1".to_string(),
-            port,
-            "tester".to_string(),
-            AuthMethod::Password("testerpass".to_string().into()),
-        );
+        let conn = test_connection(port, AuthMethod::Password("testerpass".to_string().into()));
 
         // Create a local test file
         let local_file_path = std::env::temp_dir().join("test_large_file.txt");
@@ -3327,12 +3964,7 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
         let port = server.port();
         let temp_dir = server.temp_dir().unwrap();
 
-        let conn = Connection::new(
-            "127.0.0.1".to_string(),
-            port,
-            "tester".to_string(),
-            AuthMethod::Password("testerpass".to_string().into()),
-        );
+        let conn = test_connection(port, AuthMethod::Password("testerpass".to_string().into()));
 
         // Create a remote test file
         let remote_file_name = "remote_large_file.txt";
@@ -3377,12 +4009,7 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
             .expect("failed to start embedded server");
         let port = server.port();
 
-        let conn = Connection::new(
-            "127.0.0.1".to_string(),
-            port,
-            "tester".to_string(),
-            AuthMethod::Password("testerpass".to_string().into()),
-        );
+        let conn = test_connection(port, AuthMethod::Password("testerpass".to_string().into()));
 
         // Create an original test file
         let original_file_path = std::env::temp_dir().join("original_file.txt");
@@ -3455,10 +4082,8 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
             }
         });
 
-        let conn = Connection::new(
-            "127.0.0.1".to_string(),
+        let conn = test_connection(
             ssh_port,
-            "tester".to_string(),
             AuthMethod::Password("testerpass".to_string().into()),
         );
 
@@ -3539,10 +4164,8 @@ kWCczR3NfAIXj6HNJ5DEAAAAEHRlc3RfY2xpZW50QHRlc3QBAgMEBQ==\n\
             }
         });
 
-        let conn = Connection::new(
-            "127.0.0.1".to_string(),
+        let conn = test_connection(
             ssh_port,
-            "tester".to_string(),
             AuthMethod::Password("testerpass".to_string().into()),
         );
 

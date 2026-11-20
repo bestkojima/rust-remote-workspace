@@ -381,6 +381,7 @@ fn draw_connection_form_popup_with_mode(
     };
 
     // Render form fields based on available layout space
+    let (secret_label, secret_input) = form.secret_field();
     let field_configs = [
         ("Host", &form.host, form.focus == FocusField::Host),
         ("Port", &form.port, form.focus == FocusField::Port),
@@ -390,8 +391,8 @@ fn draw_connection_form_popup_with_mode(
             form.focus == FocusField::Username,
         ),
         (
-            "Password",
-            &form.password,
+            secret_label,
+            secret_input,
             form.focus == FocusField::Password,
         ),
         (
@@ -602,80 +603,10 @@ fn create_responsive_instructions(width: u16) -> Paragraph<'static> {
 }
 
 fn create_responsive_instructions_with_import(width: u16) -> Paragraph<'static> {
-    if width < 50 {
-        // Very narrow: minimal instructions
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Ctrl+L",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-        ]))
-    } else if width < 80 {
-        // Narrow: short form
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Ctrl+L",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Load  "),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Save  "),
-            Span::styled(
-                "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Cancel"),
-        ]))
+    let actions = if width < 55 {
+        "Enter Connect   Ctrl+S Save only   Esc"
     } else {
-        // Full width: complete instructions
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Ctrl+L",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Load from SSH Config  "),
-            Span::styled(
-                "Tab",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Navigate  "),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Save  "),
-            Span::styled(
-                "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": Cancel"),
-        ]))
-    }
+        "Enter Connect   Ctrl+S Save only   Ctrl+L Import   Esc Cancel"
+    };
+    Paragraph::new(Line::styled(actions, Style::default().fg(Color::Cyan)))
 }

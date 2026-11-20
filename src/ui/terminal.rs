@@ -615,6 +615,7 @@ pub fn draw_terminal(
     name: &str,
     frame: &mut ratatui::Frame<'_>,
     selection: Option<TerminalSelection>,
+    tab_header: Option<Line<'static>>,
 ) {
     // Update search matches if needed
     state.update_search();
@@ -662,9 +663,14 @@ pub fn draw_terminal(
     };
 
     // Render the block with appropriate title
-    let mut term_block = Block::default()
-        .borders(Borders::TOP)
-        .title(Span::styled(title, title_style));
+    let mut term_block = Block::default().borders(Borders::TOP);
+    if !state.search.active
+        && let Some(header) = tab_header
+    {
+        term_block = term_block.title(header);
+    } else {
+        term_block = term_block.title(Span::styled(title, title_style));
+    }
     if state.search.active {
         term_block = term_block.border_style(Style::default().fg(Color::Yellow));
     } else {

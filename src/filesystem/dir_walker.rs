@@ -24,6 +24,11 @@ pub struct DirectoryManifest {
 /// `source_root` is the absolute path of the directory being copied.
 /// `dest_root` is the absolute path where it should be created on the destination.
 pub async fn walk_local_dir(source_root: &str, dest_root: &str) -> Result<DirectoryManifest> {
+    if tokio::fs::symlink_metadata(source_root).await?.is_symlink() {
+        return Err(Error::other(format!(
+            "Directory copy stopped at symbolic link: {source_root}"
+        )));
+    }
     let source_root = source_root.trim_end_matches('/');
     let dest_root = dest_root.trim_end_matches('/');
 
@@ -48,13 +53,17 @@ pub async fn walk_local_dir(source_root: &str, dest_root: &str) -> Result<Direct
             .map_err(|e| Error::other(format!("Failed to read entry in '{src_dir}': {e}")))?
         {
             let file_name = entry.file_name().to_string_lossy().into_owned();
-            let src_path = format!("{}/{}", src_dir.trim_end_matches('/'), file_name);
+            let src_path = entry.path().to_string_lossy().into_owned();
             let dst_path = format!("{}/{}", dst_dir.trim_end_matches('/'), file_name);
 
-            // Follow symlinks to determine actual type
-            let metadata = tokio::fs::metadata(&src_path).await.map_err(|e| {
+            let metadata = tokio::fs::symlink_metadata(&src_path).await.map_err(|e| {
                 Error::other(format!("Failed to get metadata for '{src_path}': {e}"))
             })?;
+            if metadata.is_symlink() {
+                return Err(Error::other(format!(
+                    "Directory copy stopped at symbolic link: {src_path}"
+                )));
+            }
 
             if metadata.is_dir() {
                 directories.push(dst_path.clone());
@@ -77,7 +86,19 @@ pub async fn walk_remote_dir(
     sftp: &SftpFileSystem,
     source_root: &str,
     dest_root: &str,
+    local_dest: bool,
 ) -> Result<DirectoryManifest> {
+    if sftp
+        .session()
+        .symlink_metadata(source_root)
+        .await
+        .map_err(Error::other)?
+        .is_symlink()
+    {
+        return Err(Error::other(format!(
+            "Directory copy stopped at symbolic link: {source_root}"
+        )));
+    }
     let source_root = source_root.trim_end_matches('/');
     let dest_root = dest_root.trim_end_matches('/');
 
@@ -96,8 +117,22 @@ pub async fn walk_remote_dir(
 
         for entry in entries {
             let name = entry.name.trim_end_matches('/');
+            if entry.is_symlink {
+                return Err(Error::other(format!(
+                    "Directory copy stopped at symbolic link: {}",
+                    entry.path
+                )));
+            }
+            validate_name(name, local_dest)?;
             let src_path = format!("{}/{}", src_dir.trim_end_matches('/'), name);
-            let dst_path = format!("{}/{}", dst_dir.trim_end_matches('/'), name);
+            let dst_path = if local_dest {
+                std::path::Path::new(&dst_dir)
+                    .join(name)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                format!("{}/{}", dst_dir.trim_end_matches('/'), name)
+            };
 
             if entry.is_dir {
                 directories.push(dst_path.clone());
@@ -109,6 +144,42 @@ pub async fn walk_remote_dir(
     }
 
     Ok(DirectoryManifest { directories, files })
+}
+
+/// Only a single native component may be appended to a download path.
+pub(super) fn validate_name(name: &str, local_dest: bool) -> Result<()> {
+    if matches!(name, "" | "." | "..") || name.contains(['/', '\0']) {
+        return Err(Error::other(format!("Invalid directory entry: {name:?}")));
+    }
+    if local_dest && cfg!(windows) {
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end()
+            .to_ascii_uppercase();
+        if name.ends_with([' ', '.'])
+            || name.contains(['\\', ':', '*', '?', '<', '>', '"', '|'])
+            || matches!(
+                stem.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            )
+            || (stem
+                .strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT"))
+                .is_some_and(|n| {
+                    matches!(
+                        n,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                }))
+        {
+            return Err(Error::other(format!(
+                "This remote name cannot be saved on Windows: {name:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

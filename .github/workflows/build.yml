@@ -3,9 +3,11 @@ name: build
 on:
   push:
     branches:
+      - main
       - master
   pull_request:
     branches:
+      - main
       - master
 
 jobs:
@@ -21,11 +23,11 @@ jobs:
         uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: Check code format
-        run: cargo fmt -- --check
+        run: cargo fmt --all --check
       - name: Check the package for errors
-        run: cargo check --all
+        run: cargo check --workspace --locked
       - name: Execute rust tests
-        run: cargo nextest run --all-features
+        run: cargo nextest run --workspace --all-features --locked
 
   # Windows is a shipped target but used to be built only when a tag was pushed,
   # so native-dependency breakages were discovered after the release had started.
@@ -39,4 +41,4 @@ jobs:
         with:
           key: windows
       - name: Check the package for errors
-        run: cargo check --all-targets
+        run: cargo check --workspace --all-targets --locked

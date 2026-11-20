@@ -19,7 +19,7 @@ pub fn draw_scp_progress_popup(
     frame: &mut ratatui::Frame<'_>,
 ) {
     let file_count = progress.files.len();
-    let popup_w = (area.width as f32 * 0.45) as u16;
+    let popup_w = area.width.saturating_sub(4).min(92);
 
     // Calculate how many files we can show given available space
     // Layout: 1 (connection) + N*4 (files) + optional 1 (scroll indicator) + 1 (elapsed)
@@ -154,6 +154,10 @@ pub fn draw_scp_progress_popup(
             .split(row);
 
         let (status_label, status_style) = match &file.state {
+            crate::TransferState::Cancelled => (
+                Cow::Borrowed("Cancelled"),
+                Style::default().fg(Color::Yellow),
+            ),
             crate::TransferState::Pending => {
                 (Cow::Borrowed("Pending"), Style::default().fg(Color::Gray))
             }
@@ -215,6 +219,7 @@ pub fn draw_scp_progress_popup(
         };
 
         let gauge_color = match file.state {
+            crate::TransferState::Cancelled => Color::Yellow,
             crate::TransferState::Pending
             | crate::TransferState::InProgress
             | crate::TransferState::Completed => Color::Cyan,
@@ -280,8 +285,21 @@ pub fn draw_scp_progress_popup(
             elapsed_text = format!("{elapsed_text}  ({completed}/{file_count} files)");
         }
         // Show completion hint when all files are done or fully completed
-        if progress.completed || progress.all_files_done_at.is_some() {
+        if progress.completed {
+            if progress.cancel.is_cancelled()
+                && (file_count == 0
+                    || progress
+                        .files
+                        .iter()
+                        .any(|f| matches!(f.state, crate::TransferState::Cancelled)))
+            {
+                elapsed_text = "Cancelled".into();
+            }
             elapsed_text.push_str("  •  Press Enter or Esc to close");
+        } else if progress.cancel.is_cancelled() {
+            elapsed_text.push_str("  •  Cancelling…");
+        } else {
+            elapsed_text.push_str("  •  Esc  Cancel transfer");
         }
         let time_info = Paragraph::new(Line::from(Span::styled(
             elapsed_text,

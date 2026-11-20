@@ -3,6 +3,8 @@ use thiserror::Error;
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error("Transfer cancelled")]
+    TransferCancelled,
     #[error("SSH connection failed: {0}")]
     SshConnectionError(String),
 
@@ -38,6 +40,21 @@ pub enum AppError {
 
     #[error("SSH public key validation error: {0}")]
     SshPublicKeyValidationError(String),
+
+    #[error("Unverified SSH host key: {fingerprint}")]
+    UnknownHostKey {
+        public_key: String,
+        fingerprint: String,
+    },
+
+    #[error(
+        "Host key changed for {endpoint}. Connection blocked.\nSaved: {expected}\nReceived: {received}\nVerify the change with the device administrator."
+    )]
+    HostKeyChanged {
+        endpoint: String,
+        expected: String,
+        received: String,
+    },
 
     #[error("Port forwarding error: {0}")]
     PortForwardingError(String),

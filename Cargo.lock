@@ -4407,6 +4407,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caf4aa5b0f434c91fe5c7f1ecb6a5ece2130b02ad2a590589dda5146df959001"
 
 [[package]]
+name = "remote-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "russh",
+ "tokio",
+ "toml",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5235,16 +5246,20 @@ dependencies = [
  "dirs",
  "edit",
  "futures",
+ "glob",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
+ "libc",
  "rand 0.8.5",
  "ratatui",
  "ratatui-async-explorer",
+ "remote-core",
  "ring",
  "russh",
  "russh-sftp",
  "serde",
+ "serde_json",
  "ssh2-config",
  "tempfile",
  "thiserror 1.0.69",
@@ -5258,6 +5273,8 @@ dependencies = [
  "uuid",
  "wezterm-surface",
  "wezterm-term",
+ "windows-sys 0.60.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -5464,6 +5481,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "slab",
  "socket2",
  "tokio-macros",
