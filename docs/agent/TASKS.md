@@ -16,5 +16,5 @@
 | F4 | 双栏 Files 与无 UI 的单文件传输；src/filesystem/、termirs::files | N1、R3 | P2 | Windows 本机完成 | 导航、建目录、重命名、删除确认；双栏和直接调用共用可取消的传输，失败保留原件 | [Files 实测](../testing/FILES.md)；[单文件接口](../interfaces/CORE_API.md)；两段 SSH + rathole 的 --files 路径 |
 | S5 | 多目录对、rclone 单向复制、逐项确认和历史 | F4、K2 | P3 | Windows 本机完成 | 首次、增量、目标独有项、版本变化、取消与重试、无效路径 | [操作与原生验收](../design/SYNC_USE.md)；[执行器](../testing/SYNC_ENGINE.md) |
 | Q6 | Windows 本机集成、性能、发布构建与便携包；tools/package-windows.ps1、docs/testing | R3 本机链路、F4、S5 | P1 | Windows 便携包已交付；Linux 暂缓 | Release 实际运行；记录启动、空闲、三终端、扫描/传输峰值；解压后能启动 | [Windows Release 与便携包](../testing/RELEASE.md) |
-| G6 | GitHub 源码仓库、Windows 下载与 README 快速配置 | Q6 | P1 | 私有仓库交付 | 登录有权限的账号，从 README 可下载便携包并配置第一台设备 | [源代码](https://github.com/bestkojima/rust-remote-workspace) · [Windows Release](https://github.com/bestkojima/rust-remote-workspace/releases/tag/windows-2026.11.20) |
+| G6 | GitHub 源码仓库、Windows 下载与 README 快速配置 | Q6 | P1 | 公开发布 | 未登录 GitHub 时可从 README 下载 Windows 便携包，并按快速配置连接第一台设备 | [源代码](https://github.com/bestkojima/rust-remote-workspace) · [Windows Release](https://github.com/bestkojima/rust-remote-workspace/releases/tag/windows-2026.11.20) |
 | P7 | 可选限时配对；后续 ADR、设备配置 | R3 安全验收 | P4 | 延后 | 先评审是否值得开发控制服务；不得复用 rathole token 作短码 | [产品约束](../product/PRD.md) |

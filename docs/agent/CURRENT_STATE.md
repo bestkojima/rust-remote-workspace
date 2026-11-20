@@ -1,6 +1,6 @@
 # 当前可用：Windows 本地远程工作台
 
-从 [Windows x64 Release](https://github.com/bestkojima/rust-remote-workspace/releases/tag/windows-2026.11.20) 下载便携包，解压并双击 `START.cmd`。仓库为私有，下载需使用有权访问的 GitHub 账号。首次接入见 [README 快速配置](../../README.md#快速配置)。同设备可开多个独立终端；需要转发时从 **F5 → T** 启动路由。用 **F2** 做单次 SFTP 操作，在双栏目录选好后按 **F7** 创建手动同步 Profile。[操作指南](../design/TUI_DESIGN.md) · [构建与打包](../testing/RELEASE.md)
+无需登录 GitHub 即可[下载 Windows x64 便携包](https://github.com/bestkojima/rust-remote-workspace/releases/download/windows-2026.11.20/rust-remote-windows-x64.zip)。解压并双击 `START.cmd`，按 [README 快速配置](../../README.md#快速配置) 连接第一台设备。同设备可开多个独立终端；需要转发时从 **F5 → T** 启动路由。用 **F2** 做单次 SFTP 操作，在双栏目录选好后按 **F7** 创建手动同步 Profile。[操作指南](../design/TUI_DESIGN.md) · [构建与打包](../testing/RELEASE.md)
 
 | 已实现的路径 | 证据 |
 |---|---|
